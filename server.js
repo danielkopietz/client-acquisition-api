@@ -202,7 +202,49 @@ app.get("/scans", async (req, res) => {
     });
   }
 });
+app.post("/scan/start", async (req, res) => {
+  try {
+    const {
+      company_id,
+      industry,
+      region,
+      lead_limit
+    } = req.body;
 
+    if (!company_id || !industry || !region || !lead_limit) {
+      return res.status(400).json({
+        error: "company_id, industry, region und lead_limit sind erforderlich",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO scans (
+        company_id,
+        industry,
+        region,
+        lead_limit,
+        status,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, 'queued', NOW())
+      RETURNING *
+      `,
+      [company_id, industry, region, lead_limit]
+    );
+
+    res.status(201).json({
+      message: "Scan erfolgreich angelegt",
+      scan: result.rows[0],
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: error.message || "Unknown error",
+      detail: String(error),
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`API läuft auf Port ${PORT}`);
 });

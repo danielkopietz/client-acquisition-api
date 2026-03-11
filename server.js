@@ -10,6 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const N8N_SCAN_WEBHOOK_URL = process.env.N8N_SCAN_WEBHOOK_URL || "";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -31,10 +32,12 @@ app.get("/health", async (req, res) => {
       time: result.rows[0].now,
     });
   } catch (error) {
+    console.error("Health error:", error);
     res.status(500).json({
       healthy: false,
       database: false,
-      error: error.message,
+      error: error.message || "Unknown error",
+      detail: String(error),
     });
   }
 });
@@ -60,8 +63,10 @@ app.get("/companies", async (req, res) => {
 
     res.json(result.rows);
   } catch (error) {
+    console.error("Companies error:", error);
     res.status(500).json({
-      error: error.message,
+      error: error.message || "Unknown error",
+      detail: String(error),
     });
   }
 });
@@ -92,8 +97,10 @@ app.get("/leads", async (req, res) => {
 
     res.json(result.rows);
   } catch (error) {
+    console.error("Leads error:", error);
     res.status(500).json({
-      error: error.message,
+      error: error.message || "Unknown error",
+      detail: String(error),
     });
   }
 });
@@ -171,8 +178,10 @@ app.get("/leads/:id", async (req, res) => {
       outreach_actions: outreachResult.rows,
     });
   } catch (error) {
+    console.error("Lead detail error:", error);
     res.status(500).json({
-      error: error.message,
+      error: error.message || "Unknown error",
+      detail: String(error),
     });
   }
 });
@@ -197,11 +206,14 @@ app.get("/scans", async (req, res) => {
 
     res.json(result.rows);
   } catch (error) {
+    console.error("Scans error:", error);
     res.status(500).json({
-      error: error.message,
+      error: error.message || "Unknown error",
+      detail: String(error),
     });
   }
 });
+
 app.post("/scan/start", async (req, res) => {
   try {
     const {
@@ -217,7 +229,7 @@ app.post("/scan/start", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
+    const insertResult = await pool.query(
       `
       INSERT INTO scans (
         company_id,
@@ -233,18 +245,61 @@ app.post("/scan/start", async (req, res) => {
       [company_id, industry, region, lead_limit]
     );
 
+    const newScan = insertResult.rows[0];
+
+    let webhookResult = {
+      sent: false,
+      status: null,
+      error: null,
+    };
+
+    if (N8N_SCAN_WEBHOOK_URL) {
+      try {
+        const webhookResponse = await fetch(N8N_SCAN_WEBHOOK_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            scan_id: newScan.id,
+            company_id: newScan.company_id,
+            industry: newScan.industry,
+            region: newScan.region,
+            lead_limit: newScan.lead_limit,
+            status: newScan.status,
+            created_at: newScan.created_at,
+          }),
+        });
+
+        webhookResult = {
+          sent: true,
+          status: webhookResponse.status,
+          error: null,
+        };
+      } catch (webhookError) {
+        console.error("Webhook error:", webhookError);
+        webhookResult = {
+          sent: false,
+          status: null,
+          error: webhookError.message || "Webhook request failed",
+        };
+      }
+    }
+
     res.status(201).json({
       message: "Scan erfolgreich angelegt",
-      scan: result.rows[0],
+      scan: newScan,
+      webhook: webhookResult,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Scan start error:", error);
     res.status(500).json({
       error: error.message || "Unknown error",
       detail: String(error),
     });
   }
 });
+
 app.listen(PORT, () => {
   console.log(`API läuft auf Port ${PORT}`);
 });

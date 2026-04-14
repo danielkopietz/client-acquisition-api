@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { Pool } = require("pg");
+const { auth } = require("express-oauth2-jwt-bearer");
 
 dotenv.config();
 
@@ -14,11 +15,38 @@ const N8N_SCAN_WEBHOOK_URL = process.env.N8N_SCAN_WEBHOOK_URL || "";
 const N8N_BASE = process.env.N8N_BASE_URL || "https://automatisierung.automatisierungen-ki.de/webhook";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
+const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
+const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
+const NAMESPACE = "https://api.automatisierungen-ki.de";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 // ─────────────────────────────────────────────────────────────
-// HEALTH
+// JWT MIDDLEWARE
+// ─────────────────────────────────────────────────────────────
+const checkJwt = auth({
+  audience: AUTH0_AUDIENCE,
+  issuerBaseURL: `https://${AUTH0_DOMAIN}/`,
+  tokenSigningAlg: "RS256"
+});
+
+// Helper: company_id aus JWT Token extrahieren
+function getCompanyId(req) {
+  const payload = req.auth?.payload;
+  if (!payload) return null;
+
+  // Aus custom claim (gesetzt durch Auth0 Action)
+  const fromClaim = payload[`${NAMESPACE}/company_id`];
+  if (fromClaim) return parseInt(fromClaim);
+
+  // Fallback: aus Query Parameter (für Entwicklung / Admin)
+  if (req.query.company_id) return parseInt(req.query.company_id);
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// HEALTH (kein Auth nötig)
 // ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "client-acquisition-api" });
@@ -34,18 +62,32 @@ app.get("/health", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// COMPANIES
+// COMPANIES — gibt nur die eigene Company zurück
 // ─────────────────────────────────────────────────────────────
-app.get("/companies", async (req, res) => {
+app.get("/companies", checkJwt, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT id, company_name, plan, plan_credits,
-             credits_total, credits_used,
-             (credits_total - credits_used) AS credits_remaining,
-             next_reset, status, primary_color, secondary_color,
-             logo_url, prompt_profile, created_at
-      FROM companies ORDER BY id ASC
-    `);
+    const companyId = getCompanyId(req);
+
+    if (!companyId) {
+      return res.status(400).json({ error: "Keine company_id im Token gefunden." });
+    }
+
+    const result = await pool.query(
+      `SELECT id, company_name, plan, plan_credits,
+              credits_total, credits_used,
+              (credits_total - credits_used) AS credits_remaining,
+              next_reset, status, primary_color, secondary_color,
+              logo_url, prompt_profile, created_at
+       FROM companies
+       WHERE id = $1`,
+      [companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Company nicht gefunden." });
+    }
+
+    // Gibt einzelne Company zurück (Frontend erwartet Array oder Objekt — beides abdecken)
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -53,11 +95,11 @@ app.get("/companies", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// CREDITS – Check (Frontend ruft das vor Scan-Start auf)
+// CREDITS – Check
 // ─────────────────────────────────────────────────────────────
-app.get("/credits/check", async (req, res) => {
+app.get("/credits/check", checkJwt, async (req, res) => {
   try {
-    const companyId = req.query.company_id;
+    const companyId = getCompanyId(req);
     if (!companyId) {
       return res.status(400).json({ error: "company_id fehlt" });
     }
@@ -91,8 +133,7 @@ app.get("/credits/check", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// CREDITS – Use (n8n ruft das nach jedem Insert Lead auf)
-// Gesichert mit x-internal-key Header
+// CREDITS – Use (n8n intern, kein JWT)
 // ─────────────────────────────────────────────────────────────
 app.post("/credits/use", async (req, res) => {
   const internalKey = req.headers["x-internal-key"];
@@ -136,10 +177,7 @@ app.post("/credits/use", async (req, res) => {
       [company_id, scan_id || null, lead_id || null]
     );
 
-    return res.json({
-      success: true,
-      credits_remaining: remaining - 1
-    });
+    return res.json({ success: true, credits_remaining: remaining - 1 });
   } catch (err) {
     console.error("[credits/use]", err.message);
     return res.status(500).json({ error: "Interner Fehler" });
@@ -147,7 +185,7 @@ app.post("/credits/use", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// CREDITS – Add (manuell nach Upgrade)
+// CREDITS – Add (intern)
 // ─────────────────────────────────────────────────────────────
 app.post("/credits/add", async (req, res) => {
   const internalKey = req.headers["x-internal-key"];
@@ -188,11 +226,11 @@ app.post("/credits/add", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// CREDITS – Log (Dashboard-Anzeige)
+// CREDITS – Log
 // ─────────────────────────────────────────────────────────────
-app.get("/credits/log", async (req, res) => {
+app.get("/credits/log", checkJwt, async (req, res) => {
   try {
-    const companyId = req.query.company_id;
+    const companyId = getCompanyId(req);
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
 
     if (!companyId) {
@@ -218,9 +256,7 @@ app.get("/credits/log", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// CREDITS – Monatlicher Reset (per Coolify Scheduled Task
-// oder manuell per API-Aufruf mit x-reset-secret Header)
-// Coolify Cron: 0 0 1 * *
+// CREDITS – Reset (monatlich)
 // ─────────────────────────────────────────────────────────────
 app.post("/credits/reset-all", async (req, res) => {
   const secret = req.headers["x-reset-secret"];
@@ -252,10 +288,10 @@ app.post("/credits/reset-all", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // SCANS
 // ─────────────────────────────────────────────────────────────
-app.get("/scans", async (req, res) => {
+app.get("/scans", checkJwt, async (req, res) => {
   try {
+    const companyId = getCompanyId(req);
     const limit = parseInt(req.query.limit) || 50;
-    const company_id = req.query.company_id;
 
     let query = `
       SELECT id, company_id, industry, region, lead_limit, status,
@@ -265,9 +301,9 @@ app.get("/scans", async (req, res) => {
     `;
     const params = [];
 
-    if (company_id) {
+    if (companyId) {
       query += " WHERE company_id = $1";
-      params.push(company_id);
+      params.push(companyId);
     }
 
     query += ` ORDER BY id DESC LIMIT $${params.length + 1}`;
@@ -280,7 +316,7 @@ app.get("/scans", async (req, res) => {
   }
 });
 
-app.get("/scans/:id", async (req, res) => {
+app.get("/scans/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
@@ -297,21 +333,21 @@ app.get("/scans/:id", async (req, res) => {
   }
 });
 
-// POST /scans – Scan anlegen + Credits prüfen + n8n triggern
-app.post("/scans", async (req, res) => {
+app.post("/scans", checkJwt, async (req, res) => {
   try {
-    const { company_id, industry, region, lead_limit } = req.body;
+    const companyId = getCompanyId(req);
+    const { industry, region, lead_limit } = req.body;
 
-    if (!company_id || !industry || !region || !lead_limit) {
+    if (!companyId || !industry || !region || !lead_limit) {
       return res.status(400).json({
-        error: "company_id, industry, region und lead_limit sind erforderlich"
+        error: "industry, region und lead_limit sind erforderlich"
       });
     }
 
-    // ── CREDIT CHECK vor dem Scan ────────────────────────────
+    // Credit Check
     const creditCheck = await pool.query(
       "SELECT credits_total, credits_used, (credits_total - credits_used) AS credits_remaining FROM companies WHERE id = $1",
-      [company_id]
+      [companyId]
     );
 
     if (creditCheck.rows.length === 0) {
@@ -322,26 +358,24 @@ app.post("/scans", async (req, res) => {
 
     if (credits_remaining <= 0) {
       return res.status(402).json({
-        error: "Keine Credits verfügbar. Bitte warte bis zum nächsten Reset oder buche ein Upgrade.",
+        error: "Keine Credits verfügbar. Bitte warte bis zum nächsten Reset.",
         credits_remaining: 0,
         can_scan: false
       });
     }
 
-    // Sicherstellen: lead_limit nicht größer als verfügbare Credits
     const effectiveLimit = Math.min(parseInt(lead_limit), parseInt(credits_remaining));
 
-    // ── Scan in DB anlegen ───────────────────────────────────
     const insertResult = await pool.query(
       `INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
        VALUES ($1, $2, $3, $4, 'queued', NOW()) RETURNING *`,
-      [company_id, industry, region, effectiveLimit]
+      [companyId, industry, region, effectiveLimit]
     );
 
     const newScan = insertResult.rows[0];
 
-    // ── n8n Webhook triggern ─────────────────────────────────
-    let webhookResult = { sent: false, status: null, error: null };
+    // n8n triggern
+    let webhookResult = { sent: false };
     const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
 
     if (webhookUrl) {
@@ -359,7 +393,6 @@ app.post("/scans", async (req, res) => {
         });
         webhookResult = { sent: true, status: webhookResponse.status };
       } catch (webhookError) {
-        console.error("Webhook error:", webhookError);
         webhookResult = { sent: false, error: webhookError.message };
       }
     }
@@ -367,15 +400,14 @@ app.post("/scans", async (req, res) => {
     res.status(201).json({
       scan: newScan,
       webhook: webhookResult,
-      credits_remaining: credits_remaining  // Frontend kann direkt anzeigen
+      credits_remaining
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Legacy Endpoint
-app.post("/scan/start", async (req, res) => {
+app.post("/scan/start", checkJwt, async (req, res) => {
   req.url = "/scans";
   app._router.handle(req, res, () => {});
 });
@@ -383,19 +415,19 @@ app.post("/scan/start", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // LEADS
 // ─────────────────────────────────────────────────────────────
-app.get("/leads", async (req, res) => {
+app.get("/leads", checkJwt, async (req, res) => {
   try {
-    const limit      = parseInt(req.query.limit) || 200;
-    const page       = parseInt(req.query.page)  || 1;
-    const offset     = (page - 1) * limit;
-    const company_id = req.query.company_id;
-    const scan_id    = req.query.scan_id;
+    const companyId = getCompanyId(req);
+    const limit  = parseInt(req.query.limit) || 200;
+    const page   = parseInt(req.query.page)  || 1;
+    const offset = (page - 1) * limit;
+    const scan_id = req.query.scan_id;
 
     let where = [];
     let params = [];
 
-    if (company_id) { where.push(`company_id = $${params.length + 1}`); params.push(company_id); }
-    if (scan_id)    { where.push(`scan_id = $${params.length + 1}`);    params.push(scan_id); }
+    if (companyId) { where.push(`company_id = $${params.length + 1}`); params.push(companyId); }
+    if (scan_id)   { where.push(`scan_id = $${params.length + 1}`);    params.push(scan_id); }
 
     const whereStr = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -435,11 +467,11 @@ app.get("/leads", async (req, res) => {
   }
 });
 
-app.get("/leads/stats", async (req, res) => {
+app.get("/leads/stats", checkJwt, async (req, res) => {
   try {
-    const company_id = req.query.company_id;
-    const where  = company_id ? "WHERE company_id = $1" : "";
-    const params = company_id ? [company_id] : [];
+    const companyId = getCompanyId(req);
+    const where  = companyId ? "WHERE company_id = $1" : "";
+    const params = companyId ? [companyId] : [];
 
     const result = await pool.query(
       `SELECT
@@ -469,12 +501,14 @@ app.get("/leads/stats", async (req, res) => {
   }
 });
 
-app.get("/leads/:id", async (req, res) => {
+app.get("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
+    const companyId = getCompanyId(req);
 
     const leadResult = await pool.query(
-      "SELECT * FROM leads WHERE id = $1", [id]
+      "SELECT * FROM leads WHERE id = $1 AND company_id = $2",
+      [id, companyId]
     );
 
     if (leadResult.rows.length === 0) {
@@ -491,19 +525,20 @@ app.get("/leads/:id", async (req, res) => {
   }
 });
 
-app.patch("/leads/:id", async (req, res) => {
+app.patch("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, notes, owner, next_step, follow_up } = req.body;
+    const companyId = getCompanyId(req);
+    const { status, notes } = req.body;
 
     const result = await pool.query(
       `UPDATE leads
        SET status = COALESCE($1, status),
            notes  = COALESCE($2, notes),
            updated_at = NOW()
-       WHERE id = $3
+       WHERE id = $3 AND company_id = $4
        RETURNING id, lead_name, status, notes, updated_at`,
-      [status, notes, id]
+      [status, notes, id, companyId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });
@@ -516,7 +551,7 @@ app.patch("/leads/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // AUDITS
 // ─────────────────────────────────────────────────────────────
-app.get("/audits", async (req, res) => {
+app.get("/audits", checkJwt, async (req, res) => {
   try {
     const lead_id = req.query.lead_id;
     const where  = lead_id ? "WHERE lead_id = $1" : "";
@@ -534,7 +569,7 @@ app.get("/audits", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// VIDEO – Pitchlane Callback
+// VIDEO – Pitchlane Callback (kein Auth — externer Callback)
 // ─────────────────────────────────────────────────────────────
 app.post("/leads/:id/video-complete", async (req, res) => {
   try {

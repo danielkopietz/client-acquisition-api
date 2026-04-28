@@ -8,46 +8,58 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
+
 const N8N_SCAN_WEBHOOK_URL = process.env.N8N_SCAN_WEBHOOK_URL || "";
 const N8N_BASE = process.env.N8N_BASE_URL || "https://automatisierung.automatisierungen-ki.de/webhook";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
+
+const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
+const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
+
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
 const NAMESPACE = "https://api.automatisierungen-ki.de";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// ─────────────────────────────────────────────────────────────
-// JWT MIDDLEWARE
-// ─────────────────────────────────────────────────────────────
+const safeFetch = (...args) => {
+  if (typeof fetch === "function") return fetch(...args);
+  return import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
+};
+
 const checkJwt = auth({
   audience: AUTH0_AUDIENCE,
   issuerBaseURL: `https://${AUTH0_DOMAIN}/`,
   tokenSigningAlg: "RS256"
 });
 
-// Helper: company_id aus JWT Token extrahieren
 function getCompanyId(req) {
   const payload = req.auth?.payload;
   if (!payload) return null;
 
-  // Aus custom claim (gesetzt durch Auth0 Action)
   const fromClaim = payload[`${NAMESPACE}/company_id`];
-  if (fromClaim) return parseInt(fromClaim);
+  if (fromClaim) return parseInt(fromClaim, 10);
 
-  // Fallback: aus Query Parameter (für Entwicklung / Admin)
-  if (req.query.company_id) return parseInt(req.query.company_id);
+  if (req.query.company_id) return parseInt(req.query.company_id, 10);
 
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// HEALTH (kein Auth nötig)
-// ─────────────────────────────────────────────────────────────
+function getUserEmail(req) {
+  const payload = req.auth?.payload || {};
+  return payload.email || payload[`${NAMESPACE}/email`] || null;
+}
+
+function parsePositiveInt(value, fallback, max = null) {
+  const parsed = parseInt(value, 10);
+  const safe = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return max ? Math.min(safe, max) : safe;
+}
+
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "client-acquisition-api" });
 });
@@ -61,9 +73,6 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// COMPANIES — gibt nur die eigene Company zurück
-// ─────────────────────────────────────────────────────────────
 app.get("/companies", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
@@ -77,7 +86,8 @@ app.get("/companies", checkJwt, async (req, res) => {
               credits_total, credits_used,
               (credits_total - credits_used) AS credits_remaining,
               next_reset, status, primary_color, secondary_color,
-              logo_url, prompt_profile, created_at
+              logo_url, favicon_url, prompt_profile, created_at,
+              COALESCE(features, '{}'::jsonb) AS features
        FROM companies
        WHERE id = $1`,
       [companyId]
@@ -87,16 +97,13 @@ app.get("/companies", checkJwt, async (req, res) => {
       return res.status(404).json({ error: "Company nicht gefunden." });
     }
 
-    // Gibt einzelne Company zurück (Frontend erwartet Array oder Objekt — beides abdecken)
     res.json(result.rows);
   } catch (error) {
+    console.error("[companies]", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CREDITS – Check
-// ─────────────────────────────────────────────────────────────
 app.get("/credits/check", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
@@ -118,13 +125,13 @@ app.get("/credits/check", checkJwt, async (req, res) => {
 
     const row = result.rows[0];
     return res.json({
-      credits_total:     row.credits_total,
-      credits_used:      row.credits_used,
+      credits_total: row.credits_total,
+      credits_used: row.credits_used,
       credits_remaining: row.credits_remaining,
-      plan:              row.plan,
-      plan_credits:      row.plan_credits,
-      next_reset:        row.next_reset,
-      can_scan:          row.credits_remaining > 0
+      plan: row.plan,
+      plan_credits: row.plan_credits,
+      next_reset: row.next_reset,
+      can_scan: row.credits_remaining > 0
     });
   } catch (err) {
     console.error("[credits/check]", err.message);
@@ -132,9 +139,6 @@ app.get("/credits/check", checkJwt, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CREDITS – Use (n8n intern, kein JWT)
-// ─────────────────────────────────────────────────────────────
 app.post("/credits/use", async (req, res) => {
   const internalKey = req.headers["x-internal-key"];
   if (!internalKey || internalKey !== INTERNAL_API_KEY) {
@@ -184,9 +188,6 @@ app.post("/credits/use", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CREDITS – Add (intern)
-// ─────────────────────────────────────────────────────────────
 app.post("/credits/add", async (req, res) => {
   const internalKey = req.headers["x-internal-key"];
   if (!internalKey || internalKey !== INTERNAL_API_KEY) {
@@ -216,7 +217,7 @@ app.post("/credits/add", async (req, res) => {
 
     return res.json({
       success: true,
-      credits_total:     updated.rows[0].credits_total,
+      credits_total: updated.rows[0].credits_total,
       credits_remaining: updated.rows[0].credits_total - updated.rows[0].credits_used
     });
   } catch (err) {
@@ -225,13 +226,10 @@ app.post("/credits/add", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CREDITS – Log
-// ─────────────────────────────────────────────────────────────
 app.get("/credits/log", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const limit = parsePositiveInt(req.query.limit, 50, 200);
 
     if (!companyId) {
       return res.status(400).json({ error: "company_id fehlt" });
@@ -255,9 +253,6 @@ app.get("/credits/log", checkJwt, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// CREDITS – Reset (monatlich)
-// ─────────────────────────────────────────────────────────────
 app.post("/credits/reset-all", async (req, res) => {
   const secret = req.headers["x-reset-secret"];
   if (!secret || secret !== RESET_SECRET) {
@@ -285,13 +280,10 @@ app.post("/credits/reset-all", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// SCANS
-// ─────────────────────────────────────────────────────────────
 app.get("/scans", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = parsePositiveInt(req.query.limit, 50, 200);
 
     let query = `
       SELECT id, company_id, industry, region, lead_limit, status,
@@ -312,6 +304,7 @@ app.get("/scans", checkJwt, async (req, res) => {
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (error) {
+    console.error("[scans]", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -319,16 +312,21 @@ app.get("/scans", checkJwt, async (req, res) => {
 app.get("/scans/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
+    const companyId = getCompanyId(req);
+
     const result = await pool.query(
       `SELECT id, company_id, industry, region, lead_limit, status,
               total_found, total_processed, total_inserted, total_failed,
               error_message, started_at, finished_at, created_at
-       FROM scans WHERE id = $1`,
-      [id]
+       FROM scans
+       WHERE id = $1 AND company_id = $2`,
+      [id, companyId]
     );
+
     if (result.rows.length === 0) return res.status(404).json({ error: "Scan not found" });
     res.json(result.rows[0]);
   } catch (error) {
+    console.error("[scans/:id]", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -344,7 +342,6 @@ app.post("/scans", checkJwt, async (req, res) => {
       });
     }
 
-    // Credit Check
     const creditCheck = await pool.query(
       "SELECT credits_total, credits_used, (credits_total - credits_used) AS credits_remaining FROM companies WHERE id = $1",
       [companyId]
@@ -364,7 +361,7 @@ app.post("/scans", checkJwt, async (req, res) => {
       });
     }
 
-    const effectiveLimit = Math.min(parseInt(lead_limit), parseInt(credits_remaining));
+    const effectiveLimit = Math.min(parseInt(lead_limit, 10), parseInt(credits_remaining, 10));
 
     const insertResult = await pool.query(
       `INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
@@ -374,22 +371,21 @@ app.post("/scans", checkJwt, async (req, res) => {
 
     const newScan = insertResult.rows[0];
 
-    // n8n triggern
     let webhookResult = { sent: false };
     const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
 
     if (webhookUrl) {
       try {
-        const webhookResponse = await fetch(webhookUrl, {
+        const webhookResponse = await safeFetch(webhookUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            scan_id:    newScan.id,
+            scan_id: newScan.id,
             company_id: newScan.company_id,
-            industry:   newScan.industry,
-            region:     newScan.region,
-            lead_limit: newScan.lead_limit,
-          }),
+            industry: newScan.industry,
+            region: newScan.region,
+            lead_limit: newScan.lead_limit
+          })
         });
         webhookResult = { sent: true, status: webhookResponse.status };
       } catch (webhookError) {
@@ -403,6 +399,7 @@ app.post("/scans", checkJwt, async (req, res) => {
       credits_remaining
     });
   } catch (error) {
+    console.error("[scans post]", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -412,22 +409,172 @@ app.post("/scan/start", checkJwt, async (req, res) => {
   app._router.handle(req, res, () => {});
 });
 
-// ─────────────────────────────────────────────────────────────
-// LEADS
-// ─────────────────────────────────────────────────────────────
+app.post("/analysis/start-selected", checkJwt, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+
+    if (!companyId) {
+      return res.status(400).json({
+        success: false,
+        message: "Keine company_id im Token gefunden."
+      });
+    }
+
+    const { lead_ids, requested_by } = req.body;
+
+    if (!Array.isArray(lead_ids) || lead_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Keine Leads ausgewählt."
+      });
+    }
+
+    const uniqueLeadIds = [...new Set(lead_ids.map(Number).filter(Boolean))];
+
+    if (uniqueLeadIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Keine gültigen Lead-IDs übergeben."
+      });
+    }
+
+    if (uniqueLeadIds.length > 50) {
+      return res.status(400).json({
+        success: false,
+        message: "Bitte maximal 50 Leads pro Analyse-Run auswählen."
+      });
+    }
+
+    const companyResult = await pool.query(
+      `SELECT id, company_name, credits_total, credits_used,
+              (credits_total - credits_used) AS credits_remaining,
+              COALESCE(features, '{}'::jsonb) AS features
+       FROM companies
+       WHERE id = $1`,
+      [companyId]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Company nicht gefunden."
+      });
+    }
+
+    const company = companyResult.rows[0];
+    const features = company.features || {};
+
+    if (features.selected_analysis !== true) {
+      return res.status(403).json({
+        success: false,
+        message: "Ausgewählte Analyse ist für diese Company nicht aktiviert."
+      });
+    }
+
+    if (Number(company.credits_remaining) < uniqueLeadIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Nicht genug Credits. Verfügbar: ${company.credits_remaining}, ausgewählt: ${uniqueLeadIds.length}.`
+      });
+    }
+
+    const leadsResult = await pool.query(
+      `SELECT id, status
+       FROM leads
+       WHERE company_id = $1
+         AND id = ANY($2::int[])`,
+      [companyId, uniqueLeadIds]
+    );
+
+    const foundIds = leadsResult.rows.map(row => Number(row.id));
+    const missingIds = uniqueLeadIds.filter(id => !foundIds.includes(id));
+
+    if (missingIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Einige Leads wurden nicht gefunden oder gehören nicht zu dieser Company.",
+        missing_ids: missingIds
+      });
+    }
+
+    const allowedStatuses = ["hubspot_imported", "new", "no_email"];
+    const invalidLeads = leadsResult.rows.filter(row => !allowedStatuses.includes(row.status));
+
+    if (invalidLeads.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Einige Leads können nicht analysiert werden, weil sie bereits verarbeitet werden oder abgeschlossen sind.",
+        invalid_leads: invalidLeads
+      });
+    }
+
+    if (!N8N_B4S_WF02_SELECTED_WEBHOOK_URL) {
+      return res.status(500).json({
+        success: false,
+        message: "N8N_B4S_WF02_SELECTED_WEBHOOK_URL fehlt im Backend."
+      });
+    }
+
+    const webhookRes = await safeFetch(N8N_B4S_WF02_SELECTED_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": N8N_INTERNAL_TOKEN
+      },
+      body: JSON.stringify({
+        company_id: companyId,
+        lead_ids: uniqueLeadIds,
+        requested_by: requested_by || getUserEmail(req)
+      })
+    });
+
+    if (!webhookRes.ok) {
+      const text = await webhookRes.text();
+
+      return res.status(500).json({
+        success: false,
+        message: "WF02 konnte nicht gestartet werden.",
+        details: text
+      });
+    }
+
+    return res.json({
+      success: true,
+      queued_count: uniqueLeadIds.length,
+      lead_ids: uniqueLeadIds,
+      credits_to_use: uniqueLeadIds.length
+    });
+  } catch (error) {
+    console.error("analysis/start-selected error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Interner Fehler beim Starten der Analyse.",
+      error: error.message
+    });
+  }
+});
+
 app.get("/leads", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const limit  = parseInt(req.query.limit) || 200;
-    const page   = parseInt(req.query.page)  || 1;
+    const limit = parsePositiveInt(req.query.limit, 200, 500);
+    const page = parsePositiveInt(req.query.page, 1);
     const offset = (page - 1) * limit;
     const scan_id = req.query.scan_id;
 
     let where = [];
     let params = [];
 
-    if (companyId) { where.push(`company_id = $${params.length + 1}`); params.push(companyId); }
-    if (scan_id)   { where.push(`scan_id = $${params.length + 1}`);    params.push(scan_id); }
+    if (companyId) {
+      where.push(`company_id = $${params.length + 1}`);
+      params.push(companyId);
+    }
+
+    if (scan_id) {
+      where.push(`scan_id = $${params.length + 1}`);
+      params.push(scan_id);
+    }
 
     const whereStr = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -449,7 +596,9 @@ app.get("/leads", checkJwt, async (req, res) => {
         instagram_followers, instagram_last_post_days, instagram_posts_count,
         instagram_score, instagram_activity_status, instagram_notes,
         jobs_found, jobs_count, jobs_titles, jobs_score, jobs_status, jobs_notes,
-        video_status, video_url, thumbnail_url,
+        video_status, video_url, thumbnail_url, pitchlane_video_id,
+        final_email, final_email_type,
+        analysis_requested_at, analysis_started_at, analysis_batch_id, analysis_requested_by,
         outreach_status, outreach_sent_at,
         impressum_fetch_status, impressum_extraction_status,
         created_at
@@ -470,33 +619,34 @@ app.get("/leads", checkJwt, async (req, res) => {
 app.get("/leads/stats", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const where  = companyId ? "WHERE company_id = $1" : "";
+    const where = companyId ? "WHERE company_id = $1" : "";
     const params = companyId ? [companyId] : [];
 
     const result = await pool.query(
       `SELECT
         COUNT(*) AS total,
         COUNT(CASE WHEN contact_person IS NOT NULL OR managing_director IS NOT NULL THEN 1 END) AS asp_found,
-        COUNT(CASE WHEN findymail_email IS NOT NULL OR email IS NOT NULL THEN 1 END) AS email_found,
+        COUNT(CASE WHEN findymail_email IS NOT NULL OR email IS NOT NULL OR final_email IS NOT NULL THEN 1 END) AS email_found,
         COUNT(CASE WHEN priority = 'A' THEN 1 END) AS a_leads,
         ROUND(AVG(opportunity_score)) AS avg_score,
-        COUNT(CASE WHEN video_status = 'completed' THEN 1 END) AS videos,
-        COUNT(CASE WHEN outreach_status = 'sent' THEN 1 END) AS outreach_sent
+        COUNT(CASE WHEN video_status IN ('completed', 'ready') OR video_url IS NOT NULL THEN 1 END) AS videos,
+        COUNT(CASE WHEN outreach_status IN ('sent', 'active') THEN 1 END) AS outreach_sent
        FROM leads ${where}`,
       params
     );
 
     const row = result.rows[0];
     res.json({
-      total:         parseInt(row.total)         || 0,
-      asp_found:     parseInt(row.asp_found)     || 0,
-      email_found:   parseInt(row.email_found)   || 0,
-      a_leads:       parseInt(row.a_leads)       || 0,
-      avg_score:     parseInt(row.avg_score)     || 0,
-      videos:        parseInt(row.videos)        || 0,
-      outreach_sent: parseInt(row.outreach_sent) || 0,
+      total: parseInt(row.total, 10) || 0,
+      asp_found: parseInt(row.asp_found, 10) || 0,
+      email_found: parseInt(row.email_found, 10) || 0,
+      a_leads: parseInt(row.a_leads, 10) || 0,
+      avg_score: parseInt(row.avg_score, 10) || 0,
+      videos: parseInt(row.videos, 10) || 0,
+      outreach_sent: parseInt(row.outreach_sent, 10) || 0
     });
   } catch (error) {
+    console.error("[leads/stats]", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -516,11 +666,13 @@ app.get("/leads/:id", checkJwt, async (req, res) => {
     }
 
     const auditResult = await pool.query(
-      "SELECT * FROM audits WHERE lead_id = $1 ORDER BY id DESC LIMIT 1", [id]
+      "SELECT * FROM audits WHERE lead_id = $1 ORDER BY id DESC LIMIT 1",
+      [id]
     );
 
     res.json({ ...leadResult.rows[0], audit: auditResult.rows[0] || null });
   } catch (error) {
+    console.error("[leads/:id]", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -534,7 +686,7 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     const result = await pool.query(
       `UPDATE leads
        SET status = COALESCE($1, status),
-           notes  = COALESCE($2, notes),
+           notes = COALESCE($2, notes),
            updated_at = NOW()
        WHERE id = $3 AND company_id = $4
        RETURNING id, lead_name, status, notes, updated_at`,
@@ -544,57 +696,71 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });
     res.json(result.rows[0]);
   } catch (error) {
+    console.error("[leads patch]", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// AUDITS
-// ─────────────────────────────────────────────────────────────
 app.get("/audits", checkJwt, async (req, res) => {
   try {
     const lead_id = req.query.lead_id;
-    const where  = lead_id ? "WHERE lead_id = $1" : "";
-    const params = lead_id ? [lead_id] : [];
+    const companyId = getCompanyId(req);
+
+    if (lead_id) {
+      const result = await pool.query(
+        `SELECT a.id, a.lead_id, a.audit_summary, a.audit_html, a.pdf_url, a.created_at
+         FROM audits a
+         JOIN leads l ON l.id = a.lead_id
+         WHERE a.lead_id = $1 AND l.company_id = $2
+         ORDER BY a.id DESC
+         LIMIT 50`,
+        [lead_id, companyId]
+      );
+      return res.json(result.rows);
+    }
 
     const result = await pool.query(
-      `SELECT id, lead_id, audit_summary, audit_html, pdf_url, created_at
-       FROM audits ${where} ORDER BY id DESC LIMIT 50`,
-      params
+      `SELECT a.id, a.lead_id, a.audit_summary, a.audit_html, a.pdf_url, a.created_at
+       FROM audits a
+       JOIN leads l ON l.id = a.lead_id
+       WHERE l.company_id = $1
+       ORDER BY a.id DESC
+       LIMIT 50`,
+      [companyId]
     );
+
     res.json(result.rows);
   } catch (error) {
+    console.error("[audits]", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// VIDEO – Pitchlane Callback (kein Auth — externer Callback)
-// ─────────────────────────────────────────────────────────────
 app.post("/leads/:id/video-complete", async (req, res) => {
   try {
     const { id } = req.params;
-    const { video_url, thumbnail_url, video_id } = req.body;
+    const { video_url, thumbnail_url, video_id, pitchlane_video_id } = req.body;
 
     const result = await pool.query(
       `UPDATE leads
-       SET video_status = 'completed', video_url = $1,
-           thumbnail_url = $2, video_id = $3, updated_at = NOW()
+       SET video_status = 'completed',
+           video_url = COALESCE($1, video_url),
+           thumbnail_url = COALESCE($2, thumbnail_url),
+           pitchlane_video_id = COALESCE($3, pitchlane_video_id),
+           updated_at = NOW()
        WHERE id = $4
-       RETURNING id, lead_name, video_url, video_status`,
-      [video_url, thumbnail_url, video_id, id]
+       RETURNING id, lead_name, video_url, thumbnail_url, pitchlane_video_id, video_status`,
+      [video_url || null, thumbnail_url || null, pitchlane_video_id || video_id || null, id]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });
     res.json(result.rows[0]);
   } catch (error) {
+    console.error("[video-complete]", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// START
-// ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`API laeuft auf Port ${PORT}`);
 });

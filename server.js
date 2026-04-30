@@ -580,7 +580,7 @@ app.get("/leads", checkJwt, async (req, res) => {
 
     const result = await pool.query(
       `SELECT
-        id, company_id, scan_id, lead_name, website,
+        id, company_id, scan_id, lead_name, company_name, industry, region, website,
         instagram_status, ads_status, ads_found, ads_score, ads_count, ads_active_count,
         website_score, opportunity_score, priority, sales_hook, final_sales_hook,
         audit_summary, marketing_analysis, compliment,

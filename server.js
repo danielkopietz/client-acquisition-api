@@ -19,6 +19,8 @@ const RESET_SECRET = process.env.RESET_SECRET || "";
 
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
+const N8N_VF_SCAN_WEBHOOK_URL = process.env.N8N_VF_SCAN_WEBHOOK_URL || `${N8N_BASE}/vf-maps-scraper`;
+const N8N_VF_WF02_WEBHOOK_URL = process.env.N8N_VF_WF02_WEBHOOK_URL || `${N8N_BASE}/vf-run-selected-analysis`;
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -372,24 +374,53 @@ app.post("/scans", checkJwt, async (req, res) => {
     const newScan = insertResult.rows[0];
 
     let webhookResult = { sent: false };
-    const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
 
-    if (webhookUrl) {
+    // Weiche: VF (company_id=3) bekommt eigenen Scraper-Webhook
+    const isVF = companyId === 3;
+
+    if (isVF) {
+      // Viralityfilms: query_groups mit Clustern aus Branche ableiten
+      const industryLower = (newScan.industry || "").toLowerCase();
+      const isImagefilm = ["imagefilm","werbefilm","videoproduktion","unternehmensfilm","produktionsfirma"].some(k => industryLower.includes(k));
+      const cluster = isImagefilm ? "imagefilm" : "social_media";
+
+      const vfWebhookUrl = N8N_VF_SCAN_WEBHOOK_URL;
       try {
-        const webhookResponse = await safeFetch(webhookUrl, {
+        const webhookResponse = await safeFetch(vfWebhookUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             scan_id: newScan.id,
-            company_id: newScan.company_id,
-            industry: newScan.industry,
-            region: newScan.region,
+            company_id: 3,
+            query_groups: [{ keywords: [newScan.industry], cluster }],
+            cities: [newScan.region.replace(", Deutschland", "").replace(", Germany", "").trim()],
             lead_limit: newScan.lead_limit
           })
         });
-        webhookResult = { sent: true, status: webhookResponse.status };
+        webhookResult = { sent: true, status: webhookResponse.status, mode: "vf" };
       } catch (webhookError) {
         webhookResult = { sent: false, error: webhookError.message };
+      }
+    } else {
+      // Standard B4S / andere Companies
+      const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
+      if (webhookUrl) {
+        try {
+          const webhookResponse = await safeFetch(webhookUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              scan_id: newScan.id,
+              company_id: newScan.company_id,
+              industry: newScan.industry,
+              region: newScan.region,
+              lead_limit: newScan.lead_limit
+            })
+          });
+          webhookResult = { sent: true, status: webhookResponse.status };
+        } catch (webhookError) {
+          webhookResult = { sent: false, error: webhookError.message };
+        }
       }
     }
 
@@ -464,7 +495,10 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
     const company = companyResult.rows[0];
     const features = company.features || {};
 
-    if (features.selected_analysis !== true) {
+    // Weiche: VF (company_id=3) → eigener WF02 Webhook, kein features-Check nötig
+    const isVFCompany = companyId === 3;
+
+    if (!isVFCompany && features.selected_analysis !== true) {
       return res.status(403).json({
         success: false,
         message: "Ausgewählte Analyse ist für diese Company nicht aktiviert."
@@ -497,25 +531,45 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const allowedStatuses = ["hubspot_imported", "new", "no_email"];
+    // VF: call_approved muss TRUE sein
+    if (isVFCompany) {
+      const notApproved = leadsResult.rows.filter(row => row.call_approved !== true);
+      if (notApproved.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Einige Leads haben keine Anruf-Freigabe (call_approved). Bitte erst den Kunden anrufen und Erlaubnis einholen.",
+          not_approved_ids: notApproved.map(r => r.id)
+        });
+      }
+    }
+
+    const allowedStatuses = isVFCompany
+      ? ["new", "no_email", "called", "approved"]
+      : ["hubspot_imported", "new", "no_email"];
+
     const invalidLeads = leadsResult.rows.filter(row => !allowedStatuses.includes(row.status));
 
     if (invalidLeads.length > 0) {
       return res.status(400).json({
         success: false,
-        message: "Einige Leads können nicht analysiert werden, weil sie bereits verarbeitet werden oder abgeschlossen sind.",
+        message: "Einige Leads können nicht analysiert werden.",
         invalid_leads: invalidLeads
       });
     }
 
-    if (!N8N_B4S_WF02_SELECTED_WEBHOOK_URL) {
+    // Webhook-URL je Company wählen
+    const selectedWebhookUrl = isVFCompany
+      ? N8N_VF_WF02_WEBHOOK_URL
+      : N8N_B4S_WF02_SELECTED_WEBHOOK_URL;
+
+    if (!selectedWebhookUrl) {
       return res.status(500).json({
         success: false,
-        message: "N8N_B4S_WF02_SELECTED_WEBHOOK_URL fehlt im Backend."
+        message: "Webhook-URL fehlt im Backend."
       });
     }
 
-    const webhookRes = await safeFetch(N8N_B4S_WF02_SELECTED_WEBHOOK_URL, {
+    const webhookRes = await safeFetch(selectedWebhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -601,6 +655,7 @@ app.get("/leads", checkJwt, async (req, res) => {
         analysis_requested_at, analysis_started_at, analysis_batch_id, analysis_requested_by,
         outreach_status, outreach_sent_at,
         impressum_fetch_status, impressum_extraction_status,
+        call_approved, call_notes,
         created_at
        FROM leads
        ${whereStr}
@@ -681,16 +736,20 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = getCompanyId(req);
-    const { status, notes } = req.body;
+    const { status, notes, call_approved, call_notes, email, contact_person } = req.body;
 
     const result = await pool.query(
       `UPDATE leads
        SET status = COALESCE($1, status),
            notes = COALESCE($2, notes),
+           call_approved = COALESCE($3, call_approved),
+           call_notes = COALESCE($4, call_notes),
+           email = COALESCE($5, email),
+           contact_person = COALESCE($6, contact_person),
            updated_at = NOW()
-       WHERE id = $3 AND company_id = $4
-       RETURNING id, lead_name, status, notes, updated_at`,
-      [status, notes, id, companyId]
+       WHERE id = $7 AND company_id = $8
+       RETURNING id, lead_name, status, notes, call_approved, call_notes, email, contact_person, updated_at`,
+      [status, notes, call_approved ?? null, call_notes ?? null, email ?? null, contact_person ?? null, id, companyId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });

@@ -689,6 +689,15 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       lead_name
     } = req.body;
 
+    // inhaber_vorname/nachname aus contact_person ableiten wenn geändert
+    let inhaber_vorname = null;
+    let inhaber_nachname = null;
+    if (contact_person) {
+      const parts = contact_person.trim().split(/\s+/).filter(Boolean);
+      inhaber_vorname = parts[0] || null;
+      inhaber_nachname = parts.slice(1).join(' ') || null;
+    }
+
     const result = await pool.query(
       `UPDATE leads
        SET status            = COALESCE($1, status),
@@ -700,11 +709,14 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
            contact_person    = COALESCE($7, contact_person),
            managing_director = COALESCE($8, managing_director),
            lead_name         = COALESCE($9, lead_name),
+           inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
+           inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
            updated_at        = NOW()
-       WHERE id = $10 AND company_id = $11
+       WHERE id = $12 AND company_id = $13
        RETURNING id, lead_name, status, notes,
                  call_approved, call_notes,
                  email, phone, contact_person, managing_director,
+                 inhaber_vorname, inhaber_nachname,
                  updated_at`,
       [
         status ?? null,
@@ -716,6 +728,8 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
         contact_person ?? null,
         managing_director ?? null,
         lead_name ?? null,
+        inhaber_vorname,
+        inhaber_nachname,
         id,
         companyId
       ]

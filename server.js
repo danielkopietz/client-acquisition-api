@@ -480,7 +480,7 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
     }
 
     const leadsResult = await pool.query(
-      `SELECT id, status
+      `SELECT id, status, call_approved, email
        FROM leads
        WHERE company_id = $1
          AND id = ANY($2::int[])`,
@@ -496,6 +496,20 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
         message: "Einige Leads wurden nicht gefunden oder gehören nicht zu dieser Company.",
         missing_ids: missingIds
       });
+    }
+
+    // VF: call_approved muss TRUE sein + Email vorhanden
+    if (isVFCompany) {
+      const notApproved = leadsResult.rows.filter(row =>
+        row.call_approved !== true || !row.email
+      );
+      if (notApproved.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Einige Leads haben keine Anruf-Freigabe oder fehlende E-Mail. Bitte erst freigeben.",
+          not_approved_ids: notApproved.map(r => r.id)
+        });
+      }
     }
 
     const allowedStatuses = isVFCompany
@@ -688,16 +702,58 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = getCompanyId(req);
-    const { status, notes } = req.body;
+    const {
+      status, notes,
+      call_approved, call_notes,
+      email, phone,
+      contact_person, managing_director,
+      lead_name
+    } = req.body;
+
+    // inhaber_vorname/nachname aus contact_person ableiten wenn geaendert
+    let inhaber_vorname = null;
+    let inhaber_nachname = null;
+    if (contact_person) {
+      const parts = contact_person.trim().split(/\s+/).filter(Boolean);
+      inhaber_vorname = parts[0] || null;
+      inhaber_nachname = parts.slice(1).join(' ') || null;
+    }
 
     const result = await pool.query(
       `UPDATE leads
-       SET status = COALESCE($1, status),
-           notes = COALESCE($2, notes),
-           updated_at = NOW()
-       WHERE id = $3 AND company_id = $4
-       RETURNING id, lead_name, status, notes, updated_at`,
-      [status, notes, id, companyId]
+       SET status            = COALESCE($1, status),
+           notes             = COALESCE($2, notes),
+           call_approved     = COALESCE($3, call_approved),
+           call_notes        = COALESCE($4, call_notes),
+           email             = COALESCE($5, email),
+           phone             = COALESCE($6, phone),
+           contact_person    = COALESCE($7, contact_person),
+           managing_director = COALESCE($8, managing_director),
+           lead_name         = COALESCE($9, lead_name),
+           inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
+           inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
+           updated_at        = NOW()
+       WHERE id = $12 AND company_id = $13
+       RETURNING id, lead_name, status, notes,
+                 call_approved, call_notes,
+                 email, phone, contact_person, managing_director,
+                 inhaber_vorname, inhaber_nachname,
+                 updated_at`,
+      [
+        status ?? null,
+        notes ?? null,
+        call_approved ?? null,
+        call_notes ?? null,
+        email ?? null,
+        phone ?? null,
+        contact_person ?? null,
+        managing_director ?? null,
+        lead_name ?? null,
+        inhaber_vorname,
+        inhaber_nachname,
+        id,
+        companyId
+      ]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });

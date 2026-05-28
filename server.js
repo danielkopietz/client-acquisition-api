@@ -60,6 +60,51 @@ function parsePositiveInt(value, fallback, max = null) {
   return max ? Math.min(safe, max) : safe;
 }
 
+/*
+ * Tenant-spezifische Regeln für die Auswahl-Analyse.
+ * Company 2 (Brand4Social) und Company 3 (Viralityfilms)
+ * nutzen dieselbe UI-Funktion, aber getrennte Prozesse.
+ */
+const COMPANY_IDS = Object.freeze({
+  BRAND4SOCIAL: 2,
+  VIRALITYFILMS: 3
+});
+
+function getSelectedAnalysisPolicy(companyId) {
+  const id = Number(companyId);
+
+  if (id === COMPANY_IDS.BRAND4SOCIAL) {
+    return {
+      key: "brand4social",
+      enabled: true,
+      maxLeads: 20,
+      requiresCallApproval: false,
+      allowedStatuses: ["hubspot_imported", "new", "no_email", "ready", "contact_confirmed"],
+      webhookUrl: N8N_B4S_WF02_SELECTED_WEBHOOK_URL
+    };
+  }
+
+  if (id === COMPANY_IDS.VIRALITYFILMS) {
+    return {
+      key: "viralityfilms",
+      enabled: true,
+      maxLeads: 50,
+      requiresCallApproval: true,
+      allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved"],
+      webhookUrl: process.env.N8N_VF_WF02_WEBHOOK_URL || ""
+    };
+  }
+
+  return {
+    key: "unsupported",
+    enabled: false,
+    maxLeads: 0,
+    requiresCallApproval: false,
+    allowedStatuses: [],
+    webhookUrl: ""
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "client-acquisition-api" });
 });
@@ -438,13 +483,6 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    if (uniqueLeadIds.length > 50) {
-      return res.status(400).json({
-        success: false,
-        message: "Bitte maximal 50 Leads pro Analyse-Run auswählen."
-      });
-    }
-
     const companyResult = await pool.query(
       `SELECT id, company_name, credits_total, credits_used,
               (credits_total - credits_used) AS credits_remaining,
@@ -462,13 +500,20 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
     }
 
     const company = companyResult.rows[0];
-    const features = company.features || {};
-    const isVFCompany = companyId === 3;
+    const policy = getSelectedAnalysisPolicy(companyId);
+    const isVFCompany = policy.key === "viralityfilms";
 
-    if (!isVFCompany && features.selected_analysis !== true) {
+    if (!policy.enabled) {
       return res.status(403).json({
         success: false,
         message: "Ausgewählte Analyse ist für diese Company nicht aktiviert."
+      });
+    }
+
+    if (uniqueLeadIds.length > policy.maxLeads) {
+      return res.status(400).json({
+        success: false,
+        message: `Bitte maximal ${policy.maxLeads} Leads pro Analyse-Run auswählen.`
       });
     }
 
@@ -480,7 +525,7 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
     }
 
     const leadsResult = await pool.query(
-      `SELECT id, status, call_approved, email
+      `SELECT id, status, call_approved, email, final_email, findymail_email
        FROM leads
        WHERE company_id = $1
          AND id = ANY($2::int[])`,
@@ -498,10 +543,11 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    // VF: call_approved muss TRUE sein + Email vorhanden
-    if (isVFCompany) {
+    // Ausschließlich Company 3 / Viralityfilms:
+    // telefonische Freigabe + E-Mail sind zwingend erforderlich.
+    if (policy.requiresCallApproval) {
       const notApproved = leadsResult.rows.filter(row =>
-        row.call_approved !== true || !row.email
+        row.call_approved !== true || !(row.email || row.final_email || row.findymail_email)
       );
       if (notApproved.length > 0) {
         return res.status(400).json({
@@ -512,10 +558,7 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       }
     }
 
-    const allowedStatuses = isVFCompany
-      ? ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved"]
-      : ["hubspot_imported", "new", "no_email", "ready", "contact_confirmed"];
-    const invalidLeads = leadsResult.rows.filter(row => !allowedStatuses.includes(row.status));
+    const invalidLeads = leadsResult.rows.filter(row => !policy.allowedStatuses.includes(row.status));
 
     if (invalidLeads.length > 0) {
       return res.status(400).json({
@@ -525,9 +568,9 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const selectedWebhookUrl = isVFCompany
-      ? (process.env.N8N_VF_WF02_WEBHOOK_URL || "")
-      : N8N_B4S_WF02_SELECTED_WEBHOOK_URL;
+    // Kein Fallback zwischen Kunden-Workflows:
+    // Jeder Tenant verwendet ausschließlich seinen eigenen Webhook.
+    const selectedWebhookUrl = policy.webhookUrl;
 
     if (!selectedWebhookUrl) {
       return res.status(500).json({
@@ -563,7 +606,8 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       success: true,
       queued_count: uniqueLeadIds.length,
       lead_ids: uniqueLeadIds,
-      credits_to_use: uniqueLeadIds.length
+      credits_to_use: uniqueLeadIds.length,
+      analysis_profile: policy.key
     });
   } catch (error) {
     console.error("analysis/start-selected error:", error);

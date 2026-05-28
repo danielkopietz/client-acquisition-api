@@ -463,8 +463,9 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
 
     const company = companyResult.rows[0];
     const features = company.features || {};
+    const isVFCompany = companyId === 3;
 
-    if (features.selected_analysis !== true) {
+    if (!isVFCompany && features.selected_analysis !== true) {
       return res.status(403).json({
         success: false,
         message: "Ausgewählte Analyse ist für diese Company nicht aktiviert."
@@ -497,7 +498,9 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const allowedStatuses = ["hubspot_imported", "new", "no_email"];
+    const allowedStatuses = isVFCompany
+      ? ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved"]
+      : ["hubspot_imported", "new", "no_email", "ready", "contact_confirmed"];
     const invalidLeads = leadsResult.rows.filter(row => !allowedStatuses.includes(row.status));
 
     if (invalidLeads.length > 0) {
@@ -508,14 +511,18 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    if (!N8N_B4S_WF02_SELECTED_WEBHOOK_URL) {
+    const selectedWebhookUrl = isVFCompany
+      ? (process.env.N8N_VF_WF02_WEBHOOK_URL || "")
+      : N8N_B4S_WF02_SELECTED_WEBHOOK_URL;
+
+    if (!selectedWebhookUrl) {
       return res.status(500).json({
         success: false,
-        message: "N8N_B4S_WF02_SELECTED_WEBHOOK_URL fehlt im Backend."
+        message: "Webhook-URL fehlt im Backend."
       });
     }
 
-    const webhookRes = await safeFetch(N8N_B4S_WF02_SELECTED_WEBHOOK_URL, {
+    const webhookRes = await safeFetch(selectedWebhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -681,58 +688,16 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = getCompanyId(req);
-    const {
-      status, notes,
-      call_approved, call_notes,
-      email, phone,
-      contact_person, managing_director,
-      lead_name
-    } = req.body;
-
-    // inhaber_vorname/nachname aus contact_person ableiten wenn geändert
-    let inhaber_vorname = null;
-    let inhaber_nachname = null;
-    if (contact_person) {
-      const parts = contact_person.trim().split(/\s+/).filter(Boolean);
-      inhaber_vorname = parts[0] || null;
-      inhaber_nachname = parts.slice(1).join(' ') || null;
-    }
+    const { status, notes } = req.body;
 
     const result = await pool.query(
       `UPDATE leads
-       SET status            = COALESCE($1, status),
-           notes             = COALESCE($2, notes),
-           call_approved     = COALESCE($3, call_approved),
-           call_notes        = COALESCE($4, call_notes),
-           email             = COALESCE($5, email),
-           phone             = COALESCE($6, phone),
-           contact_person    = COALESCE($7, contact_person),
-           managing_director = COALESCE($8, managing_director),
-           lead_name         = COALESCE($9, lead_name),
-           inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
-           inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
-           updated_at        = NOW()
-       WHERE id = $12 AND company_id = $13
-       RETURNING id, lead_name, status, notes,
-                 call_approved, call_notes,
-                 email, phone, contact_person, managing_director,
-                 inhaber_vorname, inhaber_nachname,
-                 updated_at`,
-      [
-        status ?? null,
-        notes ?? null,
-        call_approved ?? null,
-        call_notes ?? null,
-        email ?? null,
-        phone ?? null,
-        contact_person ?? null,
-        managing_director ?? null,
-        lead_name ?? null,
-        inhaber_vorname,
-        inhaber_nachname,
-        id,
-        companyId
-      ]
+       SET status = COALESCE($1, status),
+           notes = COALESCE($2, notes),
+           updated_at = NOW()
+       WHERE id = $3 AND company_id = $4
+       RETURNING id, lead_name, status, notes, updated_at`,
+      [status, notes, id, companyId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });

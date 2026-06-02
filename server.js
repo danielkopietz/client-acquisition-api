@@ -89,9 +89,9 @@ function getSelectedAnalysisPolicy(companyId) {
       key: "viralityfilms",
       enabled: true,
       maxLeads: 50,
-      requiresCallApproval: true,
-      allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved"],
-      webhookUrl: process.env.N8N_VF_WF02_WEBHOOK_URL || ""
+      requiresCallApproval: false,
+      allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved", "ready"],
+      webhookUrl: process.env.N8N_VF_WF02_ANALYSIS_WEBHOOK_URL || process.env.N8N_VF_WF02_WEBHOOK_URL || ""
     };
   }
 
@@ -417,37 +417,35 @@ app.post("/scans", checkJwt, async (req, res) => {
     const newScan = insertResult.rows[0];
 
     let webhookResult = { sent: false };
-
-    // Weiche: VF (company_id=3) bekommt eigenen Scraper-Webhook
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
 
     if (isVFScan) {
-      // VF: vf-maps-scraper mit city aus Region
       const cityFromRegion = (newScan.region || '').split(',')[0].trim();
       const industryLower = (newScan.industry || '').toLowerCase();
       const imagefilmKeywords = ['imagefilm','werbefilm','videoproduktion','unternehmensfilm','filmproduktion'];
       const cluster = imagefilmKeywords.some(k => industryLower.includes(k)) ? 'imagefilm' : 'social_media';
-      const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || `${N8N_BASE}/vf-maps-scraper`;
-      try {
-        const webhookResponse = await safeFetch(vfScanUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            scan_id: newScan.id,
-            company_id: 3,
-            industry: newScan.industry,
-            region: newScan.region,
-            cities: [cityFromRegion],
-            lead_limit: newScan.lead_limit,
-            query_groups: [{ keywords: [newScan.industry], cluster }]
-          })
-        });
-        webhookResult = { sent: true, status: webhookResponse.status, mode: "vf" };
-      } catch (webhookError) {
-        webhookResult = { sent: false, error: webhookError.message };
+      const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || "";
+      if (vfScanUrl) {
+        try {
+          const webhookResponse = await safeFetch(vfScanUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              scan_id: newScan.id,
+              company_id: 3,
+              industry: newScan.industry,
+              region: newScan.region,
+              cities: [cityFromRegion],
+              lead_limit: newScan.lead_limit,
+              query_groups: [{ keywords: [newScan.industry], cluster }]
+            })
+          });
+          webhookResult = { sent: true, status: webhookResponse.status, mode: "vf" };
+        } catch (webhookError) {
+          webhookResult = { sent: false, error: webhookError.message };
+        }
       }
     } else {
-      // Standard: B4S und andere
       const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
       if (webhookUrl) {
         try {
@@ -832,10 +830,74 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Lead not found" });
-    res.json(result.rows[0]);
+
+    const updatedLead = result.rows[0];
+
+    // VF: Wenn call_approved auf TRUE gesetzt wird → WF02b automatisch triggern
+    if (Number(companyId) === COMPANY_IDS.VIRALITYFILMS &&
+        call_approved === true &&
+        updatedLead.call_approved === true) {
+      const vfPitchlaneUrl = process.env.N8N_VF_WF02B_WEBHOOK_URL || "";
+      if (vfPitchlaneUrl) {
+        safeFetch(vfPitchlaneUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-internal-token": N8N_INTERNAL_TOKEN
+          },
+          body: JSON.stringify({
+            lead_id: Number(id),
+            company_id: COMPANY_IDS.VIRALITYFILMS,
+            triggered_by: getUserEmail(req) || "dashboard"
+          })
+        }).catch(e => console.error("[vf wf02b auto-trigger]", e.message));
+      }
+    }
+
+    res.json(updatedLead);
   } catch (error) {
     console.error("[leads patch]", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// VF: Manueller Pitchlane+Instantly Start (Fallback)
+app.post("/pitchlane/start", checkJwt, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) {
+      return res.status(403).json({ success: false, message: "Nur für Viralityfilms verfügbar." });
+    }
+    const { lead_id } = req.body;
+    if (!lead_id) return res.status(400).json({ success: false, message: "lead_id fehlt." });
+
+    const leadResult = await pool.query(
+      "SELECT id, call_approved, email, status FROM leads WHERE id = $1 AND company_id = $2",
+      [lead_id, companyId]
+    );
+    if (leadResult.rows.length === 0) return res.status(404).json({ success: false, message: "Lead nicht gefunden." });
+    const lead = leadResult.rows[0];
+    if (!lead.call_approved) return res.status(400).json({ success: false, message: "Lead hat keine telefonische Freigabe." });
+    if (!lead.email) return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
+
+    const vfPitchlaneUrl = process.env.N8N_VF_WF02B_WEBHOOK_URL || "";
+    if (!vfPitchlaneUrl) return res.status(500).json({ success: false, message: "Pitchlane-Webhook-URL fehlt." });
+
+    const webhookRes = await safeFetch(vfPitchlaneUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-internal-token": N8N_INTERNAL_TOKEN },
+      body: JSON.stringify({ lead_id: Number(lead_id), company_id: companyId, triggered_by: getUserEmail(req) })
+    });
+
+    if (!webhookRes.ok) {
+      const text = await webhookRes.text();
+      return res.status(500).json({ success: false, message: "Pitchlane-Start fehlgeschlagen.", details: text });
+    }
+
+    return res.json({ success: true, lead_id: Number(lead_id), message: "Pitchlane+Instantly gestartet." });
+  } catch (error) {
+    console.error("[pitchlane/start]", error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 

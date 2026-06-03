@@ -426,10 +426,11 @@ app.post("/scans", checkJwt, async (req, res) => {
       const cluster = imagefilmKeywords.some(k => industryLower.includes(k)) ? 'imagefilm' : 'social_media';
       const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || "";
 
-      // Apollo-Filter aus Request übernehmen (nur VF)
       const minEmployees = parseInt(req.body.min_employees, 10) || 51;
       const maxEmployees = parseInt(req.body.max_employees, 10) || 200;
       const source = req.body.source || "apollo";
+      const cityOverride = (req.body.city || "").trim();
+      const locationForSearch = cityOverride || cityFromRegion;
 
       if (vfScanUrl) {
         try {
@@ -441,7 +442,8 @@ app.post("/scans", checkJwt, async (req, res) => {
               company_id: 3,
               industry: newScan.industry,
               region: newScan.region,
-              cities: [cityFromRegion],
+              city: cityOverride || null,
+              cities: [locationForSearch],
               lead_limit: newScan.lead_limit,
               source,
               min_employees: minEmployees,

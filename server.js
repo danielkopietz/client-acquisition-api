@@ -425,6 +425,12 @@ app.post("/scans", checkJwt, async (req, res) => {
       const imagefilmKeywords = ['imagefilm','werbefilm','videoproduktion','unternehmensfilm','filmproduktion'];
       const cluster = imagefilmKeywords.some(k => industryLower.includes(k)) ? 'imagefilm' : 'social_media';
       const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || "";
+
+      // Apollo-Filter aus Request übernehmen (nur VF)
+      const minEmployees = parseInt(req.body.min_employees, 10) || 51;
+      const maxEmployees = parseInt(req.body.max_employees, 10) || 200;
+      const source = req.body.source || "apollo";
+
       if (vfScanUrl) {
         try {
           const webhookResponse = await safeFetch(vfScanUrl, {
@@ -437,10 +443,13 @@ app.post("/scans", checkJwt, async (req, res) => {
               region: newScan.region,
               cities: [cityFromRegion],
               lead_limit: newScan.lead_limit,
+              source,
+              min_employees: minEmployees,
+              max_employees: maxEmployees,
               query_groups: [{ keywords: [newScan.industry], cluster }]
             })
           });
-          webhookResult = { sent: true, status: webhookResponse.status, mode: "vf" };
+          webhookResult = { sent: true, status: webhookResponse.status, mode: "vf-apollo" };
         } catch (webhookError) {
           webhookResult = { sent: false, error: webhookError.message };
         }

@@ -89,7 +89,7 @@ function getSelectedAnalysisPolicy(companyId) {
       key: "viralityfilms",
       enabled: true,
       maxLeads: 50,
-      requiresCallApproval: false,
+      requiresCallApproval: true,
       allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved", "ready"],
       webhookUrl: process.env.N8N_VF_WF02_ANALYSIS_WEBHOOK_URL || process.env.N8N_VF_WF02_WEBHOOK_URL || ""
     };
@@ -793,6 +793,20 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       contact_person, managing_director,
       lead_name
     } = req.body;
+    const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
+    const shouldSyncManualEmail = isViralityFilmsCompany &&
+      Object.prototype.hasOwnProperty.call(req.body, "email");
+
+    const previousLeadResult = await pool.query(
+      "SELECT id, call_approved FROM leads WHERE id = $1 AND company_id = $2",
+      [id, companyId]
+    );
+
+    if (previousLeadResult.rows.length === 0) {
+      return res.status(404).json({ error: "Lead not found" });
+    }
+
+    const previousLead = previousLeadResult.rows[0];
 
     // inhaber_vorname/nachname aus contact_person ableiten wenn geaendert
     let inhaber_vorname = null;
@@ -816,12 +830,19 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
            lead_name         = COALESCE($9, lead_name),
            inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
            inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
+           final_email       = CASE WHEN $14::boolean THEN NULLIF($15::text, '') ELSE final_email END,
+           final_email_type  = CASE
+                                 WHEN $14::boolean THEN
+                                   CASE WHEN NULLIF($15::text, '') IS NULL THEN NULL ELSE 'manual' END
+                                 ELSE final_email_type
+                               END,
            updated_at        = NOW()
        WHERE id = $12 AND company_id = $13
        RETURNING id, lead_name, status, notes,
                  call_approved, call_notes,
                  email, phone, contact_person, managing_director,
                  inhaber_vorname, inhaber_nachname,
+                 final_email, final_email_type,
                  updated_at`,
       [
         status ?? null,
@@ -836,7 +857,9 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
         inhaber_vorname,
         inhaber_nachname,
         id,
-        companyId
+        companyId,
+        shouldSyncManualEmail,
+        email ?? null
       ]
     );
 
@@ -845,9 +868,10 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     const updatedLead = result.rows[0];
 
     // VF: Wenn call_approved auf TRUE gesetzt wird → WF02b automatisch triggern
-    if (Number(companyId) === COMPANY_IDS.VIRALITYFILMS &&
+    if (isViralityFilmsCompany &&
         call_approved === true &&
-        updatedLead.call_approved === true) {
+        updatedLead.call_approved === true &&
+        previousLead.call_approved !== true) {
       const vfPitchlaneUrl = process.env.N8N_VF_WF02B_WEBHOOK_URL || "";
       if (vfPitchlaneUrl) {
         safeFetch(vfPitchlaneUrl, {
@@ -859,6 +883,10 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
           body: JSON.stringify({
             lead_id: Number(id),
             company_id: COMPANY_IDS.VIRALITYFILMS,
+            lead_name: updatedLead.lead_name,
+            contact_person: updatedLead.contact_person,
+            email: updatedLead.email || updatedLead.final_email,
+            phone: updatedLead.phone,
             triggered_by: getUserEmail(req) || "dashboard"
           })
         }).catch(e => console.error("[vf wf02b auto-trigger]", e.message));

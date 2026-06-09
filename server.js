@@ -18,6 +18,7 @@ const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
 
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
+const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
@@ -60,6 +61,35 @@ function parsePositiveInt(value, fallback, max = null) {
   return max ? Math.min(safe, max) : safe;
 }
 
+function chunkArray(values, size) {
+  const chunks = [];
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function getSelectedLeadSplit(policy, leadIds) {
+  if (policy.key !== "company4_recruiting") {
+    return {
+      videoLeadIds: leadIds,
+      emailOnlyLeadIds: [],
+      creditsToUse: leadIds.length
+    };
+  }
+
+  const videoLimit = policy.videoLimit || 250;
+  const emailOnlyLimit = policy.emailOnlyLimit || 500;
+  const videoLeadIds = leadIds.slice(0, videoLimit);
+  const emailOnlyLeadIds = leadIds.slice(videoLimit, videoLimit + emailOnlyLimit);
+
+  return {
+    videoLeadIds,
+    emailOnlyLeadIds,
+    creditsToUse: videoLeadIds.length
+  };
+}
+
 /*
  * Tenant-spezifische Regeln für die Auswahl-Analyse.
  * Company 2 (Brand4Social) und Company 3 (Viralityfilms)
@@ -67,7 +97,8 @@ function parsePositiveInt(value, fallback, max = null) {
  */
 const COMPANY_IDS = Object.freeze({
   BRAND4SOCIAL: 2,
-  VIRALITYFILMS: 3
+  VIRALITYFILMS: 3,
+  COMPANY4_RECRUITING: 4
 });
 
 function getSelectedAnalysisPolicy(companyId) {
@@ -92,6 +123,20 @@ function getSelectedAnalysisPolicy(companyId) {
       requiresCallApproval: true,
       allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved", "ready"],
       webhookUrl: process.env.N8N_VF_WF02_ANALYSIS_WEBHOOK_URL || process.env.N8N_VF_WF02_WEBHOOK_URL || ""
+    };
+  }
+
+  if (id === COMPANY_IDS.COMPANY4_RECRUITING) {
+    return {
+      key: "company4_recruiting",
+      enabled: true,
+      maxLeads: 750,
+      videoLimit: 250,
+      emailOnlyLimit: 500,
+      requiresCallApproval: false,
+      creditsMode: "video_only",
+      allowedStatuses: ["new", "no_email", "ready", "enriched", "contact_confirmed"],
+      webhookUrl: N8N_C4_WF02_SELECTED_WEBHOOK_URL
     };
   }
 
@@ -557,10 +602,13 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    if (Number(company.credits_remaining) < uniqueLeadIds.length) {
+    const selectedSplit = getSelectedLeadSplit(policy, uniqueLeadIds);
+    const creditsToUse = selectedSplit.creditsToUse;
+
+    if (Number(company.credits_remaining) < creditsToUse) {
       return res.status(400).json({
         success: false,
-        message: `Nicht genug Credits. Verfügbar: ${company.credits_remaining}, ausgewählt: ${uniqueLeadIds.length}.`
+        message: `Nicht genug Credits. Verfügbar: ${company.credits_remaining}, benötigt: ${creditsToUse}.`
       });
     }
 
@@ -619,26 +667,69 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const webhookRes = await safeFetch(selectedWebhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-token": N8N_INTERNAL_TOKEN
-      },
-      body: JSON.stringify({
+    const requestedByValue = requested_by || getUserEmail(req) || "dashboard";
+    const requests = [];
+    const chunkSize = policy.webhookChunkSize || 50;
+
+    if (policy.key === "company4_recruiting") {
+      const selectionBatchId = `c4_dashboard_${Date.now()}`;
+
+      for (const leadIds of chunkArray(selectedSplit.videoLeadIds, chunkSize)) {
+        requests.push({
+          company_id: companyId,
+          lead_ids: leadIds,
+          lead_typ: "video",
+          skip_credits: false,
+          requested_by: requestedByValue,
+          selection_batch_id: selectionBatchId
+        });
+      }
+
+      for (const leadIds of chunkArray(selectedSplit.emailOnlyLeadIds, chunkSize)) {
+        requests.push({
+          company_id: companyId,
+          lead_ids: leadIds,
+          lead_typ: "email_only",
+          skip_credits: true,
+          requested_by: requestedByValue,
+          selection_batch_id: selectionBatchId
+        });
+      }
+    } else {
+      requests.push({
         company_id: companyId,
         lead_ids: uniqueLeadIds,
-        requested_by: requested_by || getUserEmail(req)
-      })
-    });
+        requested_by: requestedByValue
+      });
+    }
 
-    if (!webhookRes.ok) {
-      const text = await webhookRes.text();
+    const startedRuns = [];
 
-      return res.status(500).json({
-        success: false,
-        message: "WF02 konnte nicht gestartet werden.",
-        details: text
+    for (const payload of requests) {
+      const webhookRes = await safeFetch(selectedWebhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-internal-token": N8N_INTERNAL_TOKEN
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!webhookRes.ok) {
+        const text = await webhookRes.text();
+
+        return res.status(500).json({
+          success: false,
+          message: "WF02 konnte nicht gestartet werden.",
+          failed_payload: payload,
+          details: text
+        });
+      }
+
+      startedRuns.push({
+        lead_typ: payload.lead_typ || policy.key,
+        count: payload.lead_ids.length,
+        status: webhookRes.status
       });
     }
 
@@ -646,7 +737,10 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       success: true,
       queued_count: uniqueLeadIds.length,
       lead_ids: uniqueLeadIds,
-      credits_to_use: uniqueLeadIds.length,
+      video_count: selectedSplit.videoLeadIds.length,
+      email_only_count: selectedSplit.emailOnlyLeadIds.length,
+      credits_to_use: creditsToUse,
+      runs_started: startedRuns,
       analysis_profile: policy.key
     });
   } catch (error) {

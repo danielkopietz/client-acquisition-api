@@ -691,6 +691,7 @@ app.get("/leads", checkJwt, async (req, res) => {
         audit_summary, marketing_analysis, compliment,
         weakness_tags, recommended_services, recommended_channel, score_breakdown,
         channel, status, notes,
+        call_approved, call_notes,
         email, phone, contact_person, managing_director,
         inhaber_vorname, inhaber_nachname,
         findymail_email, findymail_status,

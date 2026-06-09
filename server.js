@@ -702,12 +702,20 @@ app.get("/leads", checkJwt, async (req, res) => {
         instagram_followers, instagram_last_post_days, instagram_posts_count,
         instagram_score, instagram_activity_status, instagram_notes,
         jobs_found, jobs_count, jobs_titles, jobs_score, jobs_status, jobs_notes,
-        video_status, video_url, thumbnail_url, pitchlane_video_id,
+        video_status, video_url, thumbnail_url,
+        pitchlane_video_id, pitchlane_video_url, pitchlane_status,
+        pitchlane_video_opened, pitchlane_video_started, pitchlane_video_finished,
+        pitchlane_video_view_count, pitchlane_video_start_count, pitchlane_video_finish_count,
+        pitchlane_first_opened_at, pitchlane_last_opened_at,
+        pitchlane_first_started_at, pitchlane_last_started_at,
+        pitchlane_first_finished_at, pitchlane_last_finished_at,
+        pitchlane_hot_lead, pitchlane_engagement_status,
         final_email, final_email_type,
         analysis_requested_at, analysis_started_at, analysis_batch_id, analysis_requested_by,
-        outreach_status, outreach_sent_at,
+        instantly_lead_id, instantly_campaign_id,
+        outreach_status, outreach_sent_at, outreach_completed_at,
         impressum_fetch_status, impressum_extraction_status,
-        created_at
+        created_at, updated_at
        FROM leads
        ${whereStr}
        ORDER BY opportunity_score DESC NULLS LAST, id DESC
@@ -736,7 +744,7 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
         COUNT(CASE WHEN priority = 'A' THEN 1 END) AS a_leads,
         ROUND(AVG(opportunity_score)) AS avg_score,
         COUNT(CASE WHEN video_status IN ('completed', 'ready') OR video_url IS NOT NULL THEN 1 END) AS videos,
-        COUNT(CASE WHEN outreach_status IN ('sent', 'active') THEN 1 END) AS outreach_sent
+        COUNT(CASE WHEN outreach_status IN ('sent', 'active', 'email_sent', 'email_opened', 'email_clicked', 'replied') OR status = 'outreach_active' THEN 1 END) AS outreach_sent
        FROM leads ${where}`,
       params
     );

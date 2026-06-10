@@ -863,7 +863,9 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
 app.get("/leads/reminders/due", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) return res.json([]);
+    if (![COMPANY_IDS.VIRALITYFILMS, COMPANY_IDS.COMPANY4_RECRUITING].includes(Number(companyId))) {
+      return res.json([]);
+    }
 
     const result = await pool.query(
       `SELECT id, lead_name,
@@ -960,6 +962,10 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       owner, next_step, follow_up
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
+    const supportsSalesCrm = [
+      COMPANY_IDS.VIRALITYFILMS,
+      COMPANY_IDS.COMPANY4_RECRUITING
+    ].includes(Number(companyId));
     const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
     const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
     const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");
@@ -967,12 +973,12 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     const shouldSyncManualEmail = isViralityFilmsCompany &&
       Object.prototype.hasOwnProperty.call(req.body, "email");
 
-    if (isViralityFilmsCompany && crm_status != null) {
+    if (supportsSalesCrm && crm_status != null) {
       const allowedStatuses = new Set([
         "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"
       ]);
       if (!allowedStatuses.has(String(crm_status))) {
-        return res.status(400).json({ error: "Ungültiger CRM-Status für Company 3." });
+        return res.status(400).json({ error: "Ungültiger CRM-Status." });
       }
     }
 

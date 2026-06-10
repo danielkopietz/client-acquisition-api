@@ -784,7 +784,8 @@ app.get("/leads", checkJwt, async (req, res) => {
         website_score, opportunity_score, priority, sales_hook, final_sales_hook,
         audit_summary, marketing_analysis, compliment,
         weakness_tags, recommended_services, recommended_channel, score_breakdown,
-        channel, status, notes,
+        channel, status, crm_status, notes,
+        crm_owner AS owner, crm_next_step AS next_step, crm_follow_up AS follow_up,
         call_approved, call_notes,
         email, phone, contact_person, managing_director,
         inhaber_vorname, inhaber_nachname,
@@ -859,13 +860,74 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
   }
 });
 
+app.get("/leads/reminders/due", checkJwt, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) return res.json([]);
+
+    const result = await pool.query(
+      `SELECT id, lead_name,
+              crm_next_step AS next_step,
+              crm_follow_up AS follow_up
+       FROM leads
+       WHERE company_id = $1
+         AND crm_follow_up IS NOT NULL
+         AND crm_follow_up <= NOW()
+         AND crm_reminded_at IS NULL
+         AND (crm_snoozed_until IS NULL OR crm_snoozed_until <= NOW())
+       ORDER BY crm_follow_up ASC
+       LIMIT 10`,
+      [companyId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("[leads/reminders/due]", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/leads/:id/reminder-ack", checkJwt, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = getCompanyId(req);
+    const action = String(req.body?.action || "done");
+    if (!["done", "open", "snooze"].includes(action)) {
+      return res.status(400).json({ error: "Ungültige Erinnerungsaktion." });
+    }
+
+    const result = await pool.query(
+      `UPDATE leads
+       SET crm_reminded_at = CASE WHEN $3 = 'snooze' THEN NULL ELSE NOW() END,
+           crm_snoozed_until = CASE
+             WHEN $3 = 'snooze' THEN NOW() + INTERVAL '15 minutes'
+             ELSE NULL
+           END,
+           updated_at = NOW()
+       WHERE id = $1 AND company_id = $2
+       RETURNING id, crm_follow_up AS follow_up,
+                 crm_reminded_at, crm_snoozed_until`,
+      [id, companyId, action]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Lead not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("[leads/:id/reminder-ack]", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = getCompanyId(req);
 
     const leadResult = await pool.query(
-      "SELECT * FROM leads WHERE id = $1 AND company_id = $2",
+      `SELECT *,
+              crm_owner AS owner,
+              crm_next_step AS next_step,
+              crm_follow_up AS follow_up
+       FROM leads
+       WHERE id = $1 AND company_id = $2`,
       [id, companyId]
     );
 
@@ -894,11 +956,25 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       call_approved, call_notes,
       email, phone,
       contact_person, managing_director,
-      lead_name
+      lead_name, crm_status,
+      owner, next_step, follow_up
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
+    const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
+    const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
+    const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");
+    const hasCrmStatus = Object.prototype.hasOwnProperty.call(req.body, "crm_status");
     const shouldSyncManualEmail = isViralityFilmsCompany &&
       Object.prototype.hasOwnProperty.call(req.body, "email");
+
+    if (isViralityFilmsCompany && crm_status != null) {
+      const allowedStatuses = new Set([
+        "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer"
+      ]);
+      if (!allowedStatuses.has(String(crm_status))) {
+        return res.status(400).json({ error: "Ungültiger CRM-Status für Company 3." });
+      }
+    }
 
     const previousLeadResult = await pool.query(
       "SELECT id, call_approved FROM leads WHERE id = $1 AND company_id = $2",
@@ -933,15 +1009,27 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
            lead_name         = COALESCE($9, lead_name),
            inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
            inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
-           final_email       = CASE WHEN $14::boolean THEN NULLIF($15::text, '') ELSE final_email END,
+           crm_owner         = CASE WHEN $19::boolean THEN NULLIF($12::text, '') ELSE crm_owner END,
+           crm_next_step     = CASE WHEN $20::boolean THEN NULLIF($13::text, '') ELSE crm_next_step END,
+           crm_follow_up     = CASE
+                                 WHEN $21::boolean THEN NULLIF($14::text, '')::timestamptz
+                                 ELSE crm_follow_up
+                               END,
+           crm_reminded_at   = CASE WHEN $21::boolean THEN NULL ELSE crm_reminded_at END,
+           crm_snoozed_until = CASE WHEN $21::boolean THEN NULL ELSE crm_snoozed_until END,
+           crm_status        = CASE WHEN $22::boolean THEN $23::text ELSE crm_status END,
+           final_email       = CASE WHEN $17::boolean THEN NULLIF($18::text, '') ELSE final_email END,
            final_email_type  = CASE
-                                 WHEN $14::boolean THEN
-                                   CASE WHEN NULLIF($15::text, '') IS NULL THEN NULL ELSE 'manual' END
+                                 WHEN $17::boolean THEN
+                                   CASE WHEN NULLIF($18::text, '') IS NULL THEN NULL ELSE 'manual' END
                                  ELSE final_email_type
                                END,
            updated_at        = NOW()
-       WHERE id = $12 AND company_id = $13
-       RETURNING id, lead_name, status, notes,
+       WHERE id = $15 AND company_id = $16
+       RETURNING id, lead_name, status, crm_status, notes,
+                 crm_owner AS owner,
+                 crm_next_step AS next_step,
+                 crm_follow_up AS follow_up,
                  call_approved, call_notes,
                  email, phone, contact_person, managing_director,
                  inhaber_vorname, inhaber_nachname,
@@ -959,10 +1047,18 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
         lead_name ?? null,
         inhaber_vorname,
         inhaber_nachname,
+        owner ?? null,
+        next_step ?? null,
+        follow_up ?? null,
         id,
         companyId,
         shouldSyncManualEmail,
-        email ?? null
+        email ?? null,
+        hasOwner,
+        hasNextStep,
+        hasFollowUp,
+        hasCrmStatus,
+        crm_status ?? null
       ]
     );
 

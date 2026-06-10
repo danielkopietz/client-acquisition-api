@@ -969,7 +969,7 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
 
     if (isViralityFilmsCompany && crm_status != null) {
       const allowedStatuses = new Set([
-        "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer"
+        "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"
       ]);
       if (!allowedStatuses.has(String(crm_status))) {
         return res.status(400).json({ error: "Ungültiger CRM-Status für Company 3." });

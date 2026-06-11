@@ -465,41 +465,70 @@ app.post("/scans", checkJwt, async (req, res) => {
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
 
     if (isVFScan) {
-      const cityFromRegion = (newScan.region || '').split(',')[0].trim();
-      const industryLower = (newScan.industry || '').toLowerCase();
-      const imagefilmKeywords = ['imagefilm','werbefilm','videoproduktion','unternehmensfilm','filmproduktion'];
-      const cluster = imagefilmKeywords.some(k => industryLower.includes(k)) ? 'imagefilm' : 'social_media';
-      const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || "";
+      const minEmployees = parsePositiveInt(req.body.min_employees, 51, 100000);
+      const maxEmployees = parsePositiveInt(req.body.max_employees, 200, 100000);
+      const cityOverride = String(req.body.city || "").trim();
+      const source = String(req.body.source || "apollo_outscraper").trim();
+      const vfScanUrl =
+        process.env.N8N_VF_SCAN_WEBHOOK_URL ||
+        `${N8N_BASE}/vf-maps-scraper`;
 
-      const minEmployees = parseInt(req.body.min_employees, 10) || 51;
-      const maxEmployees = parseInt(req.body.max_employees, 10) || 200;
-      const source = req.body.source || "apollo";
-      const cityOverride = (req.body.city || "").trim();
-      const locationForSearch = cityOverride || cityFromRegion;
+      if (minEmployees > maxEmployees) {
+        await pool.query(
+          "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2 AND company_id = $3",
+          ["min_employees darf nicht größer als max_employees sein", newScan.id, companyId]
+        ).catch(() => {});
+        return res.status(400).json({
+          error: "Mitarbeiter (von) darf nicht größer als Mitarbeiter (bis) sein."
+        });
+      }
 
-      if (vfScanUrl) {
-        try {
-          const webhookResponse = await safeFetch(vfScanUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              scan_id: newScan.id,
-              company_id: 3,
-              industry: newScan.industry,
-              region: newScan.region,
-              city: cityOverride || null,
-              cities: [locationForSearch],
-              lead_limit: newScan.lead_limit,
-              source,
-              min_employees: minEmployees,
-              max_employees: maxEmployees,
-              query_groups: [{ keywords: [newScan.industry], cluster }]
-            })
+      const payload = {
+        scan_id: newScan.id,
+        company_id: COMPANY_IDS.VIRALITYFILMS,
+        industry: newScan.industry,
+        region: newScan.region,
+        city: cityOverride || null,
+        lead_limit: newScan.lead_limit,
+        min_employees: minEmployees,
+        max_employees: maxEmployees,
+        source
+      };
+
+      try {
+        const webhookResponse = await safeFetch(vfScanUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const responseText = await webhookResponse.text();
+
+        if (!webhookResponse.ok) {
+          await pool.query(
+            "UPDATE scans SET status = 'failed' WHERE id = $1 AND company_id = $2",
+            [newScan.id, companyId]
+          ).catch(() => {});
+          return res.status(502).json({
+            error: "Company-3-Workflow konnte nicht gestartet werden.",
+            workflow_status: webhookResponse.status,
+            details: responseText.slice(0, 1000)
           });
-          webhookResult = { sent: true, status: webhookResponse.status, mode: "vf-apollo" };
-        } catch (webhookError) {
-          webhookResult = { sent: false, error: webhookError.message };
         }
+
+        webhookResult = {
+          sent: true,
+          status: webhookResponse.status,
+          mode: "vf-maps-scraper"
+        };
+      } catch (webhookError) {
+        await pool.query(
+          "UPDATE scans SET status = 'failed' WHERE id = $1 AND company_id = $2",
+          [newScan.id, companyId]
+        ).catch(() => {});
+        return res.status(502).json({
+          error: "Company-3-Workflow ist nicht erreichbar.",
+          details: webhookError.message
+        });
       }
     } else {
       const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;

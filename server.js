@@ -422,6 +422,9 @@ app.get("/scans/:id", checkJwt, async (req, res) => {
 });
 
 app.post("/scans", checkJwt, async (req, res) => {
+  let scanStage = "request_validation";
+  let createdScanId = null;
+
   try {
     const companyId = getCompanyId(req);
     const { industry, region, lead_limit } = req.body;
@@ -432,6 +435,7 @@ app.post("/scans", checkJwt, async (req, res) => {
       });
     }
 
+    scanStage = "credit_check";
     const creditCheck = await pool.query(
       "SELECT credits_total, credits_used, (credits_total - credits_used) AS credits_remaining FROM companies WHERE id = $1",
       [companyId]
@@ -453,6 +457,7 @@ app.post("/scans", checkJwt, async (req, res) => {
 
     const effectiveLimit = Math.min(parseInt(lead_limit, 10), parseInt(credits_remaining, 10));
 
+    scanStage = "create_scan";
     const insertResult = await pool.query(
       `INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
        VALUES ($1, $2, $3, $4, 'queued', NOW()) RETURNING *`,
@@ -460,6 +465,7 @@ app.post("/scans", checkJwt, async (req, res) => {
     );
 
     const newScan = insertResult.rows[0];
+    createdScanId = newScan.id;
 
     let webhookResult = { sent: false };
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
@@ -469,9 +475,11 @@ app.post("/scans", checkJwt, async (req, res) => {
       const maxEmployees = parsePositiveInt(req.body.max_employees, 200, 100000);
       const cityOverride = String(req.body.city || "").trim();
       const source = String(req.body.source || "apollo_outscraper").trim();
-      const vfScanUrl =
-        process.env.N8N_VF_SCAN_WEBHOOK_URL ||
-        `${N8N_BASE}/vf-maps-scraper`;
+      const canonicalVfScanUrl = `${N8N_BASE}/vf-maps-scraper`;
+      const vfScanUrls = [...new Set([
+        process.env.N8N_VF_SCAN_WEBHOOK_URL,
+        canonicalVfScanUrl
+      ].filter(Boolean))];
 
       if (minEmployees > maxEmployees) {
         await pool.query(
@@ -495,39 +503,54 @@ app.post("/scans", checkJwt, async (req, res) => {
         source
       };
 
-      try {
-        const webhookResponse = await safeFetch(vfScanUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const responseText = await webhookResponse.text();
+      scanStage = "start_company3_workflow";
+      const workflowAttempts = [];
 
-        if (!webhookResponse.ok) {
-          await pool.query(
-            "UPDATE scans SET status = 'failed' WHERE id = $1 AND company_id = $2",
-            [newScan.id, companyId]
-          ).catch(() => {});
-          return res.status(502).json({
-            error: "Company-3-Workflow konnte nicht gestartet werden.",
-            workflow_status: webhookResponse.status,
-            details: responseText.slice(0, 1000)
+      for (const vfScanUrl of vfScanUrls) {
+        try {
+          const webhookResponse = await safeFetch(vfScanUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout
+              ? AbortSignal.timeout(20000)
+              : undefined
+          });
+          const responseText = await webhookResponse.text();
+
+          workflowAttempts.push({
+            url: vfScanUrl,
+            status: webhookResponse.status,
+            details: responseText.slice(0, 500)
+          });
+
+          if (webhookResponse.ok) {
+            webhookResult = {
+              sent: true,
+              status: webhookResponse.status,
+              mode: "vf-maps-scraper",
+              url: vfScanUrl
+            };
+            break;
+          }
+        } catch (webhookError) {
+          workflowAttempts.push({
+            url: vfScanUrl,
+            error: webhookError.message
           });
         }
+      }
 
-        webhookResult = {
-          sent: true,
-          status: webhookResponse.status,
-          mode: "vf-maps-scraper"
-        };
-      } catch (webhookError) {
+      if (!webhookResult.sent) {
         await pool.query(
-          "UPDATE scans SET status = 'failed' WHERE id = $1 AND company_id = $2",
-          [newScan.id, companyId]
+          "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2 AND company_id = $3",
+          [JSON.stringify(workflowAttempts).slice(0, 4000), newScan.id, companyId]
         ).catch(() => {});
+
         return res.status(502).json({
-          error: "Company-3-Workflow ist nicht erreichbar.",
-          details: webhookError.message
+          error: "Company-3-Workflow konnte nicht gestartet werden.",
+          stage: scanStage,
+          attempts: workflowAttempts
         });
       }
     } else {
@@ -558,8 +581,25 @@ app.post("/scans", checkJwt, async (req, res) => {
       credits_remaining
     });
   } catch (error) {
-    console.error("[scans post]", error);
-    res.status(500).json({ error: error.message });
+    console.error("[scans post]", {
+      stage: scanStage,
+      scan_id: createdScanId,
+      message: error.message,
+      stack: error.stack
+    });
+
+    if (createdScanId) {
+      await pool.query(
+        "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2",
+        [`${scanStage}: ${error.message}`.slice(0, 4000), createdScanId]
+      ).catch(() => {});
+    }
+
+    res.status(500).json({
+      error: error.message,
+      stage: scanStage,
+      scan_id: createdScanId
+    });
   }
 });
 

@@ -458,11 +458,44 @@ app.post("/scans", checkJwt, async (req, res) => {
     const effectiveLimit = Math.min(parseInt(lead_limit, 10), parseInt(credits_remaining, 10));
 
     scanStage = "create_scan";
-    const insertResult = await pool.query(
-      `INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
-       VALUES ($1, $2, $3, $4, 'queued', NOW()) RETURNING *`,
-      [companyId, industry, region, effectiveLimit]
-    );
+    const scanInsertSql = `
+      INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
+      VALUES ($1, $2, $3, $4, 'queued', NOW())
+      RETURNING *
+    `;
+    const scanInsertValues = [companyId, industry, region, effectiveLimit];
+    let insertResult;
+
+    try {
+      insertResult = await pool.query(scanInsertSql, scanInsertValues);
+    } catch (insertError) {
+      const isScanPrimaryKeyConflict =
+        insertError.code === "23505" &&
+        insertError.constraint === "scans_pkey";
+
+      if (!isScanPrimaryKeyConflict) throw insertError;
+
+      scanStage = "repair_scan_id_sequence";
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("LOCK TABLE scans IN SHARE ROW EXCLUSIVE MODE");
+        await client.query(
+          `SELECT setval(
+             pg_get_serial_sequence('scans', 'id'),
+             COALESCE((SELECT MAX(id) FROM scans), 0) + 1,
+             false
+           )`
+        );
+        insertResult = await client.query(scanInsertSql, scanInsertValues);
+        await client.query("COMMIT");
+      } catch (repairError) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw repairError;
+      } finally {
+        client.release();
+      }
+    }
 
     const newScan = insertResult.rows[0];
     createdScanId = newScan.id;

@@ -1397,14 +1397,24 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
     const requestedBy = getUserEmail(req) || "dashboard";
     const note = `E-Mail-Wiederholungsversand über Instantly angefordert am ${requestedAt} von ${requestedBy}.`;
 
-    await pool.query(
-      `UPDATE leads
-       SET instantly_lead_id = COALESCE(NULLIF(instantly_lead_id, ''), $1),
-           outreach_notes = CONCAT(COALESCE(outreach_notes || E'\n', ''), $2),
-           updated_at = NOW()
-       WHERE id = $3 AND company_id = $4`,
-      [String(instantlyLead.id), note, leadId, companyId]
-    );
+    try {
+      await pool.query(
+        `UPDATE leads
+         SET instantly_lead_id = COALESCE(NULLIF(instantly_lead_id, ''), $1::text),
+             outreach_notes = CONCAT_WS(
+               E'\n',
+               NULLIF(outreach_notes, ''),
+               $2::text
+             ),
+             updated_at = NOW()
+         WHERE id = $3::integer AND company_id = $4::integer`,
+        [String(instantlyLead.id), note, leadId, companyId]
+      );
+    } catch (logError) {
+      // Der Instantly-Aufruf war bereits erfolgreich. Ein optionaler
+      // DB-Notizfehler darf deshalb keinen erneuten Versand provozieren.
+      console.error("[instantly/resend db-log]", logError);
+    }
 
     return res.json({
       success: true,

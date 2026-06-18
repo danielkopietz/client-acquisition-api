@@ -21,6 +21,11 @@ const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBH
 const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
+// Company 3: gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
+const INSTANTLY_API_BASE_URL = (process.env.INSTANTLY_API_BASE_URL || "https://api.instantly.ai/api/v2").replace(/\/+$/, "");
+const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
+const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
+
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
 const NAMESPACE = "https://api.automatisierungen-ki.de";
@@ -31,6 +36,44 @@ const safeFetch = (...args) => {
   if (typeof fetch === "function") return fetch(...args);
   return import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
 };
+
+async function instantlyRequest(path, options = {}) {
+  const token = String(INSTANTLY_API_KEY).replace(/^Bearer\s+/i, "").trim();
+  if (!token) {
+    const error = new Error("INSTANTLY_API_KEY fehlt im Backend.");
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const response = await safeFetch(`${INSTANTLY_API_BASE_URL}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+  });
+
+  const responseText = await response.text();
+  let payload = null;
+  try {
+    payload = responseText ? JSON.parse(responseText) : null;
+  } catch (_) {
+    payload = responseText || null;
+  }
+
+  if (!response.ok) {
+    const details = typeof payload === "string"
+      ? payload
+      : payload?.message || payload?.error || JSON.stringify(payload || {});
+    const error = new Error(`Instantly API ${response.status}: ${details}`);
+    error.statusCode = response.status;
+    error.payload = payload;
+    throw error;
+  }
+
+  return payload;
+}
 
 const checkJwt = auth({
   audience: AUTH0_AUDIENCE,
@@ -1204,6 +1247,179 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   } catch (error) {
     console.error("[leads patch]", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// VF: Bereits versendete E-Mail gezielt erneut über Instantly anstoßen.
+// Verwendet ausschließlich eine Instantly-Subsequence und startet weder
+// Analyse, Pitchlane noch den regulären WF02 erneut.
+app.post("/instantly/resend", checkJwt, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) {
+      return res.status(403).json({
+        success: false,
+        message: "Der E-Mail-Wiederholungsversand ist nur für Company 3 verfügbar."
+      });
+    }
+
+    const leadId = Number(req.body?.lead_id);
+    if (!Number.isInteger(leadId) || leadId <= 0) {
+      return res.status(400).json({ success: false, message: "Gültige lead_id fehlt." });
+    }
+
+    if (!INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
+      return res.status(500).json({
+        success: false,
+        message: "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID fehlt im Backend."
+      });
+    }
+
+    const leadResult = await pool.query(
+      `SELECT id, lead_name, email, final_email, findymail_email,
+              instantly_lead_id, instantly_campaign_id,
+              outreach_status, outreach_sent_at, status, call_approved
+       FROM leads
+       WHERE id = $1 AND company_id = $2`,
+      [leadId, companyId]
+    );
+
+    if (leadResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Lead nicht gefunden." });
+    }
+
+    const lead = leadResult.rows[0];
+    const email = String(lead.email || lead.final_email || lead.findymail_email || "")
+      .trim()
+      .toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
+    }
+
+    if (lead.call_approved !== true) {
+      return res.status(400).json({
+        success: false,
+        message: "Für diesen Lead liegt keine telefonische E-Mail-Freigabe vor."
+      });
+    }
+
+    const resendableStatuses = new Set([
+      "sent",
+      "active",
+      "email_sent",
+      "email_opened",
+      "email_clicked",
+      "replied",
+      "outreach_active",
+      "outreach_completed"
+    ]);
+    const wasAlreadySent = Boolean(
+      lead.instantly_lead_id ||
+      lead.outreach_sent_at ||
+      resendableStatuses.has(String(lead.outreach_status || "").toLowerCase()) ||
+      resendableStatuses.has(String(lead.status || "").toLowerCase())
+    );
+
+    if (!wasAlreadySent) {
+      return res.status(409).json({
+        success: false,
+        message: "Für diesen Lead ist noch kein Erstversand dokumentiert."
+      });
+    }
+
+    let instantlyLead = null;
+    const storedInstantlyLeadId = String(lead.instantly_lead_id || "").trim();
+
+    if (storedInstantlyLeadId) {
+      try {
+        instantlyLead = await instantlyRequest(`/leads/${encodeURIComponent(storedInstantlyLeadId)}`);
+      } catch (error) {
+        if (![400, 404].includes(Number(error.statusCode))) throw error;
+      }
+    }
+
+    if (
+      instantlyLead?.id &&
+      String(instantlyLead.email || "").trim().toLowerCase() !== email
+    ) {
+      instantlyLead = null;
+    }
+
+    // Ältere Datensätze enthalten teilweise noch keine Instantly-v2-ID.
+    // In diesem Fall wird der bestehende Kontakt sicher über die E-Mail gesucht.
+    if (!instantlyLead?.id) {
+      const lookupBody = {
+        contacts: [email],
+        limit: 20,
+        distinct_contacts: false
+      };
+
+      const lookupResult = await instantlyRequest("/leads/list", {
+        method: "POST",
+        body: lookupBody
+      });
+      const candidates = Array.isArray(lookupResult?.items) ? lookupResult.items : [];
+
+      instantlyLead = candidates.find(item =>
+        String(item.email || "").trim().toLowerCase() === email &&
+        (!lead.instantly_campaign_id || item.campaign === lead.instantly_campaign_id)
+      ) || candidates.find(item =>
+        String(item.email || "").trim().toLowerCase() === email
+      ) || null;
+    }
+
+    if (!instantlyLead?.id) {
+      return res.status(409).json({
+        success: false,
+        message: "Der bestehende Kontakt wurde in Instantly nicht gefunden."
+      });
+    }
+
+    // Erneutes Klicken ist erlaubt: Falls der Lead noch in derselben
+    // Resend-Subsequence steckt, wird er zuerst entfernt und dann neu gestartet.
+    if (instantlyLead.subsequence_id === INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
+      await instantlyRequest("/leads/subsequence/remove", {
+        method: "POST",
+        body: { id: instantlyLead.id }
+      });
+    }
+
+    const resendResult = await instantlyRequest("/leads/subsequence/move", {
+      method: "POST",
+      body: {
+        id: instantlyLead.id,
+        subsequence_id: INSTANTLY_VF_RESEND_SUBSEQUENCE_ID
+      }
+    });
+
+    const requestedAt = new Date().toISOString();
+    const requestedBy = getUserEmail(req) || "dashboard";
+    const note = `E-Mail-Wiederholungsversand über Instantly angefordert am ${requestedAt} von ${requestedBy}.`;
+
+    await pool.query(
+      `UPDATE leads
+       SET instantly_lead_id = COALESCE(NULLIF(instantly_lead_id, ''), $1),
+           outreach_notes = CONCAT(COALESCE(outreach_notes || E'\n', ''), $2),
+           updated_at = NOW()
+       WHERE id = $3 AND company_id = $4`,
+      [String(instantlyLead.id), note, leadId, companyId]
+    );
+
+    return res.json({
+      success: true,
+      lead_id: leadId,
+      instantly_lead_id: resendResult?.id || instantlyLead.id,
+      email,
+      requested_at: requestedAt,
+      message: "Erneuter E-Mail-Versand wurde bei Instantly angefordert."
+    });
+  } catch (error) {
+    console.error("[instantly/resend]", error);
+    return res.status(Number(error.statusCode) || 500).json({
+      success: false,
+      message: error.message || "Wiederholungsversand fehlgeschlagen."
+    });
   }
 });
 

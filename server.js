@@ -18,13 +18,7 @@ const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
 
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
-const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
-
-// Company 3: gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
-const INSTANTLY_API_BASE_URL = (process.env.INSTANTLY_API_BASE_URL || "https://api.instantly.ai/api/v2").replace(/\/+$/, "");
-const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
-const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -36,44 +30,6 @@ const safeFetch = (...args) => {
   if (typeof fetch === "function") return fetch(...args);
   return import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
 };
-
-async function instantlyRequest(path, options = {}) {
-  const token = String(INSTANTLY_API_KEY).replace(/^Bearer\s+/i, "").trim();
-  if (!token) {
-    const error = new Error("INSTANTLY_API_KEY fehlt im Backend.");
-    error.statusCode = 500;
-    throw error;
-  }
-
-  const response = await safeFetch(`${INSTANTLY_API_BASE_URL}${path}`, {
-    method: options.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
-
-  const responseText = await response.text();
-  let payload = null;
-  try {
-    payload = responseText ? JSON.parse(responseText) : null;
-  } catch (_) {
-    payload = responseText || null;
-  }
-
-  if (!response.ok) {
-    const details = typeof payload === "string"
-      ? payload
-      : payload?.message || payload?.error || JSON.stringify(payload || {});
-    const error = new Error(`Instantly API ${response.status}: ${details}`);
-    error.statusCode = response.status;
-    error.payload = payload;
-    throw error;
-  }
-
-  return payload;
-}
 
 const checkJwt = auth({
   audience: AUTH0_AUDIENCE,
@@ -104,35 +60,6 @@ function parsePositiveInt(value, fallback, max = null) {
   return max ? Math.min(safe, max) : safe;
 }
 
-function chunkArray(values, size) {
-  const chunks = [];
-  for (let i = 0; i < values.length; i += size) {
-    chunks.push(values.slice(i, i + size));
-  }
-  return chunks;
-}
-
-function getSelectedLeadSplit(policy, leadIds) {
-  if (policy.key !== "company4_recruiting") {
-    return {
-      videoLeadIds: leadIds,
-      emailOnlyLeadIds: [],
-      creditsToUse: leadIds.length
-    };
-  }
-
-  const videoLimit = policy.videoLimit || 250;
-  const emailOnlyLimit = policy.emailOnlyLimit || 500;
-  const videoLeadIds = leadIds.slice(0, videoLimit);
-  const emailOnlyLeadIds = leadIds.slice(videoLimit, videoLimit + emailOnlyLimit);
-
-  return {
-    videoLeadIds,
-    emailOnlyLeadIds,
-    creditsToUse: videoLeadIds.length
-  };
-}
-
 /*
  * Tenant-spezifische Regeln für die Auswahl-Analyse.
  * Company 2 (Brand4Social) und Company 3 (Viralityfilms)
@@ -140,8 +67,7 @@ function getSelectedLeadSplit(policy, leadIds) {
  */
 const COMPANY_IDS = Object.freeze({
   BRAND4SOCIAL: 2,
-  VIRALITYFILMS: 3,
-  COMPANY4_RECRUITING: 4
+  VIRALITYFILMS: 3
 });
 
 function getSelectedAnalysisPolicy(companyId) {
@@ -166,20 +92,6 @@ function getSelectedAnalysisPolicy(companyId) {
       requiresCallApproval: true,
       allowedStatuses: ["new", "no_email", "contact_confirmed", "ready_for_analysis", "called", "approved", "ready"],
       webhookUrl: process.env.N8N_VF_WF02_ANALYSIS_WEBHOOK_URL || process.env.N8N_VF_WF02_WEBHOOK_URL || ""
-    };
-  }
-
-  if (id === COMPANY_IDS.COMPANY4_RECRUITING) {
-    return {
-      key: "company4_recruiting",
-      enabled: true,
-      maxLeads: 750,
-      videoLimit: 250,
-      emailOnlyLimit: 500,
-      requiresCallApproval: false,
-      creditsMode: "video_only",
-      allowedStatuses: ["new", "no_email", "ready", "enriched", "contact_confirmed"],
-      webhookUrl: N8N_C4_WF02_SELECTED_WEBHOOK_URL
     };
   }
 
@@ -465,9 +377,6 @@ app.get("/scans/:id", checkJwt, async (req, res) => {
 });
 
 app.post("/scans", checkJwt, async (req, res) => {
-  let scanStage = "request_validation";
-  let createdScanId = null;
-
   try {
     const companyId = getCompanyId(req);
     const { industry, region, lead_limit } = req.body;
@@ -478,7 +387,6 @@ app.post("/scans", checkJwt, async (req, res) => {
       });
     }
 
-    scanStage = "credit_check";
     const creditCheck = await pool.query(
       "SELECT credits_total, credits_used, (credits_total - credits_used) AS credits_remaining FROM companies WHERE id = $1",
       [companyId]
@@ -500,134 +408,53 @@ app.post("/scans", checkJwt, async (req, res) => {
 
     const effectiveLimit = Math.min(parseInt(lead_limit, 10), parseInt(credits_remaining, 10));
 
-    scanStage = "create_scan";
-    const scanInsertSql = `
-      INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
-      VALUES ($1, $2, $3, $4, 'queued', NOW())
-      RETURNING *
-    `;
-    const scanInsertValues = [companyId, industry, region, effectiveLimit];
-    let insertResult;
-
-    try {
-      insertResult = await pool.query(scanInsertSql, scanInsertValues);
-    } catch (insertError) {
-      const isScanPrimaryKeyConflict =
-        insertError.code === "23505" &&
-        insertError.constraint === "scans_pkey";
-
-      if (!isScanPrimaryKeyConflict) throw insertError;
-
-      scanStage = "repair_scan_id_sequence";
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("LOCK TABLE scans IN SHARE ROW EXCLUSIVE MODE");
-        await client.query(
-          `SELECT setval(
-             pg_get_serial_sequence('scans', 'id'),
-             COALESCE((SELECT MAX(id) FROM scans), 0) + 1,
-             false
-           )`
-        );
-        insertResult = await client.query(scanInsertSql, scanInsertValues);
-        await client.query("COMMIT");
-      } catch (repairError) {
-        await client.query("ROLLBACK").catch(() => {});
-        throw repairError;
-      } finally {
-        client.release();
-      }
-    }
+    const insertResult = await pool.query(
+      `INSERT INTO scans (company_id, industry, region, lead_limit, status, created_at)
+       VALUES ($1, $2, $3, $4, 'queued', NOW()) RETURNING *`,
+      [companyId, industry, region, effectiveLimit]
+    );
 
     const newScan = insertResult.rows[0];
-    createdScanId = newScan.id;
 
     let webhookResult = { sent: false };
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
 
     if (isVFScan) {
-      const minEmployees = parsePositiveInt(req.body.min_employees, 51, 100000);
-      const maxEmployees = parsePositiveInt(req.body.max_employees, 200, 100000);
-      const cityOverride = String(req.body.city || "").trim();
-      const source = String(req.body.source || "apollo_outscraper").trim();
-      const canonicalVfScanUrl = `${N8N_BASE}/vf-maps-scraper`;
-      const vfScanUrls = [...new Set([
-        process.env.N8N_VF_SCAN_WEBHOOK_URL,
-        canonicalVfScanUrl
-      ].filter(Boolean))];
+      const cityFromRegion = (newScan.region || '').split(',')[0].trim();
+      const industryLower = (newScan.industry || '').toLowerCase();
+      const imagefilmKeywords = ['imagefilm','werbefilm','videoproduktion','unternehmensfilm','filmproduktion'];
+      const cluster = imagefilmKeywords.some(k => industryLower.includes(k)) ? 'imagefilm' : 'social_media';
+      const vfScanUrl = process.env.N8N_VF_SCAN_WEBHOOK_URL || "";
 
-      if (minEmployees > maxEmployees) {
-        await pool.query(
-          "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2 AND company_id = $3",
-          ["min_employees darf nicht größer als max_employees sein", newScan.id, companyId]
-        ).catch(() => {});
-        return res.status(400).json({
-          error: "Mitarbeiter (von) darf nicht größer als Mitarbeiter (bis) sein."
-        });
-      }
+      const minEmployees = parseInt(req.body.min_employees, 10) || 51;
+      const maxEmployees = parseInt(req.body.max_employees, 10) || 200;
+      const source = req.body.source || "apollo";
+      const cityOverride = (req.body.city || "").trim();
+      const locationForSearch = cityOverride || cityFromRegion;
 
-      const payload = {
-        scan_id: newScan.id,
-        company_id: COMPANY_IDS.VIRALITYFILMS,
-        industry: newScan.industry,
-        region: newScan.region,
-        city: cityOverride || null,
-        lead_limit: newScan.lead_limit,
-        min_employees: minEmployees,
-        max_employees: maxEmployees,
-        source
-      };
-
-      scanStage = "start_company3_workflow";
-      const workflowAttempts = [];
-
-      for (const vfScanUrl of vfScanUrls) {
+      if (vfScanUrl) {
         try {
           const webhookResponse = await safeFetch(vfScanUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-            signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout
-              ? AbortSignal.timeout(20000)
-              : undefined
+            body: JSON.stringify({
+              scan_id: newScan.id,
+              company_id: 3,
+              industry: newScan.industry,
+              region: newScan.region,
+              city: cityOverride || null,
+              cities: [locationForSearch],
+              lead_limit: newScan.lead_limit,
+              source,
+              min_employees: minEmployees,
+              max_employees: maxEmployees,
+              query_groups: [{ keywords: [newScan.industry], cluster }]
+            })
           });
-          const responseText = await webhookResponse.text();
-
-          workflowAttempts.push({
-            url: vfScanUrl,
-            status: webhookResponse.status,
-            details: responseText.slice(0, 500)
-          });
-
-          if (webhookResponse.ok) {
-            webhookResult = {
-              sent: true,
-              status: webhookResponse.status,
-              mode: "vf-maps-scraper",
-              url: vfScanUrl
-            };
-            break;
-          }
+          webhookResult = { sent: true, status: webhookResponse.status, mode: "vf-apollo" };
         } catch (webhookError) {
-          workflowAttempts.push({
-            url: vfScanUrl,
-            error: webhookError.message
-          });
+          webhookResult = { sent: false, error: webhookError.message };
         }
-      }
-
-      if (!webhookResult.sent) {
-        await pool.query(
-          "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2 AND company_id = $3",
-          [JSON.stringify(workflowAttempts).slice(0, 4000), newScan.id, companyId]
-        ).catch(() => {});
-
-        return res.status(502).json({
-          error: "Company-3-Workflow konnte nicht gestartet werden.",
-          stage: scanStage,
-          attempts: workflowAttempts
-        });
       }
     } else {
       const webhookUrl = N8N_SCAN_WEBHOOK_URL || `${N8N_BASE}/scan-start`;
@@ -657,25 +484,8 @@ app.post("/scans", checkJwt, async (req, res) => {
       credits_remaining
     });
   } catch (error) {
-    console.error("[scans post]", {
-      stage: scanStage,
-      scan_id: createdScanId,
-      message: error.message,
-      stack: error.stack
-    });
-
-    if (createdScanId) {
-      await pool.query(
-        "UPDATE scans SET status = 'failed', error_message = $1 WHERE id = $2",
-        [`${scanStage}: ${error.message}`.slice(0, 4000), createdScanId]
-      ).catch(() => {});
-    }
-
-    res.status(500).json({
-      error: error.message,
-      stage: scanStage,
-      scan_id: createdScanId
-    });
+    console.error("[scans post]", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -747,13 +557,10 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const selectedSplit = getSelectedLeadSplit(policy, uniqueLeadIds);
-    const creditsToUse = selectedSplit.creditsToUse;
-
-    if (Number(company.credits_remaining) < creditsToUse) {
+    if (Number(company.credits_remaining) < uniqueLeadIds.length) {
       return res.status(400).json({
         success: false,
-        message: `Nicht genug Credits. Verfügbar: ${company.credits_remaining}, benötigt: ${creditsToUse}.`
+        message: `Nicht genug Credits. Verfügbar: ${company.credits_remaining}, ausgewählt: ${uniqueLeadIds.length}.`
       });
     }
 
@@ -812,69 +619,26 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const requestedByValue = requested_by || getUserEmail(req) || "dashboard";
-    const requests = [];
-    const chunkSize = policy.webhookChunkSize || 50;
-
-    if (policy.key === "company4_recruiting") {
-      const selectionBatchId = `c4_dashboard_${Date.now()}`;
-
-      for (const leadIds of chunkArray(selectedSplit.videoLeadIds, chunkSize)) {
-        requests.push({
-          company_id: companyId,
-          lead_ids: leadIds,
-          lead_typ: "video",
-          skip_credits: false,
-          requested_by: requestedByValue,
-          selection_batch_id: selectionBatchId
-        });
-      }
-
-      for (const leadIds of chunkArray(selectedSplit.emailOnlyLeadIds, chunkSize)) {
-        requests.push({
-          company_id: companyId,
-          lead_ids: leadIds,
-          lead_typ: "email_only",
-          skip_credits: true,
-          requested_by: requestedByValue,
-          selection_batch_id: selectionBatchId
-        });
-      }
-    } else {
-      requests.push({
+    const webhookRes = await safeFetch(selectedWebhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": N8N_INTERNAL_TOKEN
+      },
+      body: JSON.stringify({
         company_id: companyId,
         lead_ids: uniqueLeadIds,
-        requested_by: requestedByValue
-      });
-    }
+        requested_by: requested_by || getUserEmail(req)
+      })
+    });
 
-    const startedRuns = [];
+    if (!webhookRes.ok) {
+      const text = await webhookRes.text();
 
-    for (const payload of requests) {
-      const webhookRes = await safeFetch(selectedWebhookUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-internal-token": N8N_INTERNAL_TOKEN
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!webhookRes.ok) {
-        const text = await webhookRes.text();
-
-        return res.status(500).json({
-          success: false,
-          message: "WF02 konnte nicht gestartet werden.",
-          failed_payload: payload,
-          details: text
-        });
-      }
-
-      startedRuns.push({
-        lead_typ: payload.lead_typ || policy.key,
-        count: payload.lead_ids.length,
-        status: webhookRes.status
+      return res.status(500).json({
+        success: false,
+        message: "WF02 konnte nicht gestartet werden.",
+        details: text
       });
     }
 
@@ -882,10 +646,7 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       success: true,
       queued_count: uniqueLeadIds.length,
       lead_ids: uniqueLeadIds,
-      video_count: selectedSplit.videoLeadIds.length,
-      email_only_count: selectedSplit.emailOnlyLeadIds.length,
-      credits_to_use: creditsToUse,
-      runs_started: startedRuns,
+      credits_to_use: uniqueLeadIds.length,
       analysis_profile: policy.key
     });
   } catch (error) {
@@ -929,8 +690,7 @@ app.get("/leads", checkJwt, async (req, res) => {
         website_score, opportunity_score, priority, sales_hook, final_sales_hook,
         audit_summary, marketing_analysis, compliment,
         weakness_tags, recommended_services, recommended_channel, score_breakdown,
-        channel, status, crm_status, notes,
-        crm_owner AS owner, crm_next_step AS next_step, crm_follow_up AS follow_up,
+        channel, status, notes,
         call_approved, call_notes,
         email, phone, contact_person, managing_director,
         inhaber_vorname, inhaber_nachname,
@@ -1005,76 +765,13 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
   }
 });
 
-app.get("/leads/reminders/due", checkJwt, async (req, res) => {
-  try {
-    const companyId = getCompanyId(req);
-    if (![COMPANY_IDS.VIRALITYFILMS, COMPANY_IDS.COMPANY4_RECRUITING].includes(Number(companyId))) {
-      return res.json([]);
-    }
-
-    const result = await pool.query(
-      `SELECT id, lead_name,
-              crm_next_step AS next_step,
-              crm_follow_up AS follow_up
-       FROM leads
-       WHERE company_id = $1
-         AND crm_follow_up IS NOT NULL
-         AND crm_follow_up <= NOW()
-         AND crm_reminded_at IS NULL
-         AND (crm_snoozed_until IS NULL OR crm_snoozed_until <= NOW())
-       ORDER BY crm_follow_up ASC
-       LIMIT 10`,
-      [companyId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("[leads/reminders/due]", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post("/leads/:id/reminder-ack", checkJwt, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const companyId = getCompanyId(req);
-    const action = String(req.body?.action || "done");
-    if (!["done", "open", "snooze"].includes(action)) {
-      return res.status(400).json({ error: "Ungültige Erinnerungsaktion." });
-    }
-
-    const result = await pool.query(
-      `UPDATE leads
-       SET crm_reminded_at = CASE WHEN $3 = 'snooze' THEN NULL ELSE NOW() END,
-           crm_snoozed_until = CASE
-             WHEN $3 = 'snooze' THEN NOW() + INTERVAL '15 minutes'
-             ELSE NULL
-           END,
-           updated_at = NOW()
-       WHERE id = $1 AND company_id = $2
-       RETURNING id, crm_follow_up AS follow_up,
-                 crm_reminded_at, crm_snoozed_until`,
-      [id, companyId, action]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: "Lead not found" });
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("[leads/:id/reminder-ack]", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.get("/leads/:id", checkJwt, async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = getCompanyId(req);
 
     const leadResult = await pool.query(
-      `SELECT *,
-              crm_owner AS owner,
-              crm_next_step AS next_step,
-              crm_follow_up AS follow_up
-       FROM leads
-       WHERE id = $1 AND company_id = $2`,
+      "SELECT * FROM leads WHERE id = $1 AND company_id = $2",
       [id, companyId]
     );
 
@@ -1103,29 +800,11 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       call_approved, call_notes,
       email, phone,
       contact_person, managing_director,
-      lead_name, crm_status,
-      owner, next_step, follow_up
+      lead_name
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
-    const supportsSalesCrm = [
-      COMPANY_IDS.VIRALITYFILMS,
-      COMPANY_IDS.COMPANY4_RECRUITING
-    ].includes(Number(companyId));
-    const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
-    const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
-    const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");
-    const hasCrmStatus = Object.prototype.hasOwnProperty.call(req.body, "crm_status");
     const shouldSyncManualEmail = isViralityFilmsCompany &&
       Object.prototype.hasOwnProperty.call(req.body, "email");
-
-    if (supportsSalesCrm && crm_status != null) {
-      const allowedStatuses = new Set([
-        "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"
-      ]);
-      if (!allowedStatuses.has(String(crm_status))) {
-        return res.status(400).json({ error: "Ungültiger CRM-Status." });
-      }
-    }
 
     const previousLeadResult = await pool.query(
       "SELECT id, call_approved FROM leads WHERE id = $1 AND company_id = $2",
@@ -1160,27 +839,15 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
            lead_name         = COALESCE($9, lead_name),
            inhaber_vorname   = CASE WHEN $7::text IS NOT NULL THEN $10::text ELSE inhaber_vorname END,
            inhaber_nachname  = CASE WHEN $7::text IS NOT NULL THEN $11::text ELSE inhaber_nachname END,
-           crm_owner         = CASE WHEN $19::boolean THEN NULLIF($12::text, '') ELSE crm_owner END,
-           crm_next_step     = CASE WHEN $20::boolean THEN NULLIF($13::text, '') ELSE crm_next_step END,
-           crm_follow_up     = CASE
-                                 WHEN $21::boolean THEN NULLIF($14::text, '')::timestamptz
-                                 ELSE crm_follow_up
-                               END,
-           crm_reminded_at   = CASE WHEN $21::boolean THEN NULL ELSE crm_reminded_at END,
-           crm_snoozed_until = CASE WHEN $21::boolean THEN NULL ELSE crm_snoozed_until END,
-           crm_status        = CASE WHEN $22::boolean THEN $23::text ELSE crm_status END,
-           final_email       = CASE WHEN $17::boolean THEN NULLIF($18::text, '') ELSE final_email END,
+           final_email       = CASE WHEN $14::boolean THEN NULLIF($15::text, '') ELSE final_email END,
            final_email_type  = CASE
-                                 WHEN $17::boolean THEN
-                                   CASE WHEN NULLIF($18::text, '') IS NULL THEN NULL ELSE 'manual' END
+                                 WHEN $14::boolean THEN
+                                   CASE WHEN NULLIF($15::text, '') IS NULL THEN NULL ELSE 'manual' END
                                  ELSE final_email_type
                                END,
            updated_at        = NOW()
-       WHERE id = $15 AND company_id = $16
-       RETURNING id, lead_name, status, crm_status, notes,
-                 crm_owner AS owner,
-                 crm_next_step AS next_step,
-                 crm_follow_up AS follow_up,
+       WHERE id = $12 AND company_id = $13
+       RETURNING id, lead_name, status, notes,
                  call_approved, call_notes,
                  email, phone, contact_person, managing_director,
                  inhaber_vorname, inhaber_nachname,
@@ -1198,18 +865,10 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
         lead_name ?? null,
         inhaber_vorname,
         inhaber_nachname,
-        owner ?? null,
-        next_step ?? null,
-        follow_up ?? null,
         id,
         companyId,
         shouldSyncManualEmail,
-        email ?? null,
-        hasOwner,
-        hasNextStep,
-        hasFollowUp,
-        hasCrmStatus,
-        crm_status ?? null
+        email ?? null
       ]
     );
 
@@ -1247,189 +906,6 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   } catch (error) {
     console.error("[leads patch]", error);
     res.status(500).json({ error: error.message });
-  }
-});
-
-// VF: Bereits versendete E-Mail gezielt erneut über Instantly anstoßen.
-// Verwendet ausschließlich eine Instantly-Subsequence und startet weder
-// Analyse, Pitchlane noch den regulären WF02 erneut.
-app.post("/instantly/resend", checkJwt, async (req, res) => {
-  try {
-    const companyId = getCompanyId(req);
-    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) {
-      return res.status(403).json({
-        success: false,
-        message: "Der E-Mail-Wiederholungsversand ist nur für Company 3 verfügbar."
-      });
-    }
-
-    const leadId = Number(req.body?.lead_id);
-    if (!Number.isInteger(leadId) || leadId <= 0) {
-      return res.status(400).json({ success: false, message: "Gültige lead_id fehlt." });
-    }
-
-    if (!INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
-      return res.status(500).json({
-        success: false,
-        message: "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID fehlt im Backend."
-      });
-    }
-
-    const leadResult = await pool.query(
-      `SELECT id, lead_name, email, final_email, findymail_email,
-              instantly_lead_id, instantly_campaign_id,
-              outreach_status, outreach_sent_at, status, call_approved
-       FROM leads
-       WHERE id = $1 AND company_id = $2`,
-      [leadId, companyId]
-    );
-
-    if (leadResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Lead nicht gefunden." });
-    }
-
-    const lead = leadResult.rows[0];
-    const email = String(lead.email || lead.final_email || lead.findymail_email || "")
-      .trim()
-      .toLowerCase();
-
-    if (!email) {
-      return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
-    }
-
-    if (lead.call_approved !== true) {
-      return res.status(400).json({
-        success: false,
-        message: "Für diesen Lead liegt keine telefonische E-Mail-Freigabe vor."
-      });
-    }
-
-    const resendableStatuses = new Set([
-      "sent",
-      "active",
-      "email_sent",
-      "email_opened",
-      "email_clicked",
-      "replied",
-      "outreach_active",
-      "outreach_completed"
-    ]);
-    const wasAlreadySent = Boolean(
-      lead.instantly_lead_id ||
-      lead.outreach_sent_at ||
-      resendableStatuses.has(String(lead.outreach_status || "").toLowerCase()) ||
-      resendableStatuses.has(String(lead.status || "").toLowerCase())
-    );
-
-    if (!wasAlreadySent) {
-      return res.status(409).json({
-        success: false,
-        message: "Für diesen Lead ist noch kein Erstversand dokumentiert."
-      });
-    }
-
-    let instantlyLead = null;
-    const storedInstantlyLeadId = String(lead.instantly_lead_id || "").trim();
-
-    if (storedInstantlyLeadId) {
-      try {
-        instantlyLead = await instantlyRequest(`/leads/${encodeURIComponent(storedInstantlyLeadId)}`);
-      } catch (error) {
-        if (![400, 404].includes(Number(error.statusCode))) throw error;
-      }
-    }
-
-    if (
-      instantlyLead?.id &&
-      String(instantlyLead.email || "").trim().toLowerCase() !== email
-    ) {
-      instantlyLead = null;
-    }
-
-    // Ältere Datensätze enthalten teilweise noch keine Instantly-v2-ID.
-    // In diesem Fall wird der bestehende Kontakt sicher über die E-Mail gesucht.
-    if (!instantlyLead?.id) {
-      const lookupBody = {
-        contacts: [email],
-        limit: 20,
-        distinct_contacts: false
-      };
-
-      const lookupResult = await instantlyRequest("/leads/list", {
-        method: "POST",
-        body: lookupBody
-      });
-      const candidates = Array.isArray(lookupResult?.items) ? lookupResult.items : [];
-
-      instantlyLead = candidates.find(item =>
-        String(item.email || "").trim().toLowerCase() === email &&
-        (!lead.instantly_campaign_id || item.campaign === lead.instantly_campaign_id)
-      ) || candidates.find(item =>
-        String(item.email || "").trim().toLowerCase() === email
-      ) || null;
-    }
-
-    if (!instantlyLead?.id) {
-      return res.status(409).json({
-        success: false,
-        message: "Der bestehende Kontakt wurde in Instantly nicht gefunden."
-      });
-    }
-
-    // Erneutes Klicken ist erlaubt: Falls der Lead noch in derselben
-    // Resend-Subsequence steckt, wird er zuerst entfernt und dann neu gestartet.
-    if (instantlyLead.subsequence_id === INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
-      await instantlyRequest("/leads/subsequence/remove", {
-        method: "POST",
-        body: { id: instantlyLead.id }
-      });
-    }
-
-    const resendResult = await instantlyRequest("/leads/subsequence/move", {
-      method: "POST",
-      body: {
-        id: instantlyLead.id,
-        subsequence_id: INSTANTLY_VF_RESEND_SUBSEQUENCE_ID
-      }
-    });
-
-    const requestedAt = new Date().toISOString();
-    const requestedBy = getUserEmail(req) || "dashboard";
-    const note = `E-Mail-Wiederholungsversand über Instantly angefordert am ${requestedAt} von ${requestedBy}.`;
-
-    try {
-      await pool.query(
-        `UPDATE leads
-         SET instantly_lead_id = COALESCE(NULLIF(instantly_lead_id, ''), $1::text),
-             outreach_notes = CONCAT_WS(
-               E'\n',
-               NULLIF(outreach_notes, ''),
-               $2::text
-             ),
-             updated_at = NOW()
-         WHERE id = $3::integer AND company_id = $4::integer`,
-        [String(instantlyLead.id), note, leadId, companyId]
-      );
-    } catch (logError) {
-      // Der Instantly-Aufruf war bereits erfolgreich. Ein optionaler
-      // DB-Notizfehler darf deshalb keinen erneuten Versand provozieren.
-      console.error("[instantly/resend db-log]", logError);
-    }
-
-    return res.json({
-      success: true,
-      lead_id: leadId,
-      instantly_lead_id: resendResult?.id || instantlyLead.id,
-      email,
-      requested_at: requestedAt,
-      message: "Erneuter E-Mail-Versand wurde bei Instantly angefordert."
-    });
-  } catch (error) {
-    console.error("[instantly/resend]", error);
-    return res.status(Number(error.statusCode) || 500).json({
-      success: false,
-      message: error.message || "Wiederholungsversand fehlgeschlagen."
-    });
   }
 });
 

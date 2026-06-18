@@ -21,46 +21,10 @@ const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBH
 const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
-// Tenant-spezifischer Wiederholungsversand ohne Pitchlane/WF02-Neustart.
+// Company 3: gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
 const INSTANTLY_API_BASE_URL = (process.env.INSTANTLY_API_BASE_URL || "https://api.instantly.ai/api/v2").replace(/\/+$/, "");
 const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
 const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
-const INSTANTLY_C4_RESEND_CONFIGS = Object.freeze([
-  {
-    campaignId: process.env.INSTANTLY_C4_VIDEO_DE_CAMPAIGN_ID || "7d18efb3-07f9-4ff8-b121-548fc69a7936",
-    subsequenceId: process.env.INSTANTLY_C4_RESEND_SUBSEQUENCE_VIDEO_DE_ID || "",
-    envName: "INSTANTLY_C4_RESEND_SUBSEQUENCE_VIDEO_DE_ID"
-  },
-  {
-    campaignId: process.env.INSTANTLY_C4_VIDEO_EN_CAMPAIGN_ID || "20224cce-4e63-4b52-9365-ee135a7de5c3",
-    subsequenceId: process.env.INSTANTLY_C4_RESEND_SUBSEQUENCE_VIDEO_EN_ID || "",
-    envName: "INSTANTLY_C4_RESEND_SUBSEQUENCE_VIDEO_EN_ID"
-  },
-  {
-    campaignId: process.env.INSTANTLY_C4_EMAIL_ONLY_DE_CAMPAIGN_ID || "34d58ae6-71a0-4d06-8a65-96347e03d977",
-    subsequenceId: process.env.INSTANTLY_C4_RESEND_SUBSEQUENCE_EMAIL_ONLY_DE_ID || "",
-    envName: "INSTANTLY_C4_RESEND_SUBSEQUENCE_EMAIL_ONLY_DE_ID"
-  },
-  {
-    campaignId: process.env.INSTANTLY_C4_EMAIL_ONLY_EN_CAMPAIGN_ID || "4939f63d-94e3-4f16-9d4f-d685b2a17d74",
-    subsequenceId: process.env.INSTANTLY_C4_RESEND_SUBSEQUENCE_EMAIL_ONLY_EN_ID || "",
-    envName: "INSTANTLY_C4_RESEND_SUBSEQUENCE_EMAIL_ONLY_EN_ID"
-  }
-]);
-
-function getInstantlyResendConfig(companyId, campaignId) {
-  if (Number(companyId) === COMPANY_IDS.VIRALITYFILMS) {
-    return {
-      subsequenceId: INSTANTLY_VF_RESEND_SUBSEQUENCE_ID,
-      envName: "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID"
-    };
-  }
-
-  if (Number(companyId) !== COMPANY_IDS.COMPANY4_RECRUITING) return null;
-  return INSTANTLY_C4_RESEND_CONFIGS.find(config =>
-    config.campaignId && config.campaignId === String(campaignId || "").trim()
-  ) || null;
-}
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -1164,7 +1128,9 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     }
 
     const previousLeadResult = await pool.query(
-      "SELECT id, call_approved FROM leads WHERE id = $1 AND company_id = $2",
+      `SELECT id, call_approved, email, final_email, contact_person
+       FROM leads
+       WHERE id = $1 AND company_id = $2`,
       [id, companyId]
     );
 
@@ -1253,11 +1219,23 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
 
     const updatedLead = result.rows[0];
 
-    // VF: Wenn call_approved auf TRUE gesetzt wird → WF02b automatisch triggern
-    if (isViralityFilmsCompany &&
-        call_approved === true &&
-        updatedLead.call_approved === true &&
-        previousLead.call_approved !== true) {
+    const normalizeComparableText = value => String(value || "").trim().toLowerCase();
+    const previousEmail = normalizeComparableText(previousLead.email || previousLead.final_email);
+    const currentEmail = normalizeComparableText(updatedLead.email || updatedLead.final_email);
+    const previousContact = normalizeComparableText(previousLead.contact_person);
+    const currentContact = normalizeComparableText(updatedLead.contact_person);
+    const approvalGrantedNow = previousLead.call_approved !== true && updatedLead.call_approved === true;
+    const emailChanged = previousEmail !== currentEmail;
+    const contactChanged = previousContact !== currentContact;
+    const shouldTriggerVfWf02b = Boolean(
+      isViralityFilmsCompany &&
+      updatedLead.call_approved === true &&
+      (approvalGrantedNow || emailChanged || contactChanged)
+    );
+
+    // VF: Erstfreigabe oder geänderter Empfänger erzeugt ein neues Video
+    // und startet anschließend den regulären Instantly-Versand.
+    if (shouldTriggerVfWf02b) {
       const vfPitchlaneUrl = process.env.N8N_VF_WF02B_WEBHOOK_URL || "";
       if (vfPitchlaneUrl) {
         safeFetch(vfPitchlaneUrl, {
@@ -1273,11 +1251,33 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
             contact_person: updatedLead.contact_person,
             email: updatedLead.email || updatedLead.final_email,
             phone: updatedLead.phone,
+            regenerate_video: true,
+            approval_granted_now: approvalGrantedNow,
+            contact_changed: contactChanged,
+            email_changed: emailChanged,
+            trigger_reason: approvalGrantedNow
+              ? "initial_approval"
+              : [contactChanged ? "contact_changed" : null, emailChanged ? "email_changed" : null]
+                  .filter(Boolean)
+                  .join("+"),
             triggered_by: getUserEmail(req) || "dashboard"
           })
+        }).then(response => {
+          if (!response.ok) {
+            console.error("[vf wf02b auto-trigger] HTTP", response.status);
+          }
         }).catch(e => console.error("[vf wf02b auto-trigger]", e.message));
       }
     }
+
+    updatedLead.wf02b_triggered = shouldTriggerVfWf02b;
+    updatedLead.wf02b_trigger_reason = shouldTriggerVfWf02b
+      ? (approvalGrantedNow
+          ? "initial_approval"
+          : [contactChanged ? "contact_changed" : null, emailChanged ? "email_changed" : null]
+              .filter(Boolean)
+              .join("+"))
+      : null;
 
     res.json(updatedLead);
   } catch (error) {
@@ -1286,19 +1286,16 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
   }
 });
 
-// Company 3 und Company 4: Bereits versendete E-Mail gezielt erneut
-// über die jeweils eigene Instantly-Subsequence anstoßen.
+// VF: Bereits versendete E-Mail gezielt erneut über Instantly anstoßen.
 // Verwendet ausschließlich eine Instantly-Subsequence und startet weder
 // Analyse, Pitchlane noch den regulären WF02 erneut.
 app.post("/instantly/resend", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
-    const isCompany4Recruiting = Number(companyId) === COMPANY_IDS.COMPANY4_RECRUITING;
-    if (!isViralityFilmsCompany && !isCompany4Recruiting) {
+    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) {
       return res.status(403).json({
         success: false,
-        message: "Der E-Mail-Wiederholungsversand ist für diesen Tenant nicht verfügbar."
+        message: "Der E-Mail-Wiederholungsversand ist nur für Company 3 verfügbar."
       });
     }
 
@@ -1307,13 +1304,10 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(400).json({ success: false, message: "Gültige lead_id fehlt." });
     }
 
-    const initialResendConfig = isViralityFilmsCompany
-      ? getInstantlyResendConfig(companyId, null)
-      : null;
-    if (isViralityFilmsCompany && !initialResendConfig?.subsequenceId) {
+    if (!INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
       return res.status(500).json({
         success: false,
-        message: `${initialResendConfig?.envName || "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID"} fehlt im Backend.`
+        message: "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID fehlt im Backend."
       });
     }
 
@@ -1339,7 +1333,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
     }
 
-    if (isViralityFilmsCompany && lead.call_approved !== true) {
+    if (lead.call_approved !== true) {
       return res.status(400).json({
         success: false,
         message: "Für diesen Lead liegt keine telefonische E-Mail-Freigabe vor."
@@ -1418,32 +1412,9 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       });
     }
 
-    const resendConfig = isViralityFilmsCompany
-      ? initialResendConfig
-      : getInstantlyResendConfig(
-          companyId,
-          lead.instantly_campaign_id || instantlyLead.campaign
-        );
-
-    if (!resendConfig) {
-      return res.status(409).json({
-        success: false,
-        message: "Für die Instantly-Kampagne dieses Company-4-Leads ist keine Resend-Subsequence konfiguriert."
-      });
-    }
-
-    if (!resendConfig.subsequenceId) {
-      return res.status(500).json({
-        success: false,
-        message: `${resendConfig.envName} fehlt im Backend.`
-      });
-    }
-
-    const resendSubsequenceId = resendConfig.subsequenceId;
-
     // Erneutes Klicken ist erlaubt: Falls der Lead noch in derselben
     // Resend-Subsequence steckt, wird er zuerst entfernt und dann neu gestartet.
-    if (instantlyLead.subsequence_id === resendSubsequenceId) {
+    if (instantlyLead.subsequence_id === INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
       await instantlyRequest("/leads/subsequence/remove", {
         method: "POST",
         body: { id: instantlyLead.id }
@@ -1454,7 +1425,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       method: "POST",
       body: {
         id: instantlyLead.id,
-        subsequence_id: resendSubsequenceId
+        subsequence_id: INSTANTLY_VF_RESEND_SUBSEQUENCE_ID
       }
     });
 

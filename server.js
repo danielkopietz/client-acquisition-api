@@ -144,6 +144,21 @@ const COMPANY_IDS = Object.freeze({
   COMPANY4_RECRUITING: 4
 });
 
+const ARCHIVED_LEAD_STATUSES = Object.freeze([
+  "archived",
+  "completed",
+  "done",
+  "closed",
+  "outreach_completed"
+]);
+
+function getArchiveMode(value) {
+  const mode = String(value || "active").toLowerCase();
+  if (["true", "1", "archived", "archive"].includes(mode)) return "archived";
+  if (["all", "any"].includes(mode)) return "all";
+  return "active";
+}
+
 function getSelectedAnalysisPolicy(companyId) {
   const id = Number(companyId);
 
@@ -902,10 +917,11 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
 app.get("/leads", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const limit = parsePositiveInt(req.query.limit, 200, 500);
+    const limit = parsePositiveInt(req.query.limit, 500, 1000);
     const page = parsePositiveInt(req.query.page, 1);
     const offset = (page - 1) * limit;
     const scan_id = req.query.scan_id;
+    const archiveMode = getArchiveMode(req.query.archived);
 
     let where = [];
     let params = [];
@@ -918,6 +934,15 @@ app.get("/leads", checkJwt, async (req, res) => {
     if (scan_id) {
       where.push(`scan_id = $${params.length + 1}`);
       params.push(scan_id);
+    }
+
+    const archiveParamIndex = params.length + 1;
+    if (archiveMode === "archived") {
+      where.push(`(COALESCE(status, '') = ANY($${archiveParamIndex}::text[]) OR COALESCE(crm_status, '') = ANY($${archiveParamIndex}::text[]))`);
+      params.push(ARCHIVED_LEAD_STATUSES);
+    } else if (archiveMode === "active") {
+      where.push(`NOT (COALESCE(status, '') = ANY($${archiveParamIndex}::text[]) OR COALESCE(crm_status, '') = ANY($${archiveParamIndex}::text[]))`);
+      params.push(ARCHIVED_LEAD_STATUSES);
     }
 
     const whereStr = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -975,18 +1000,22 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
     const companyId = getCompanyId(req);
     const where = companyId ? "WHERE company_id = $1" : "";
     const params = companyId ? [companyId] : [];
+    const activeCondition = `NOT (COALESCE(status, '') = ANY($${params.length + 1}::text[]) OR COALESCE(crm_status, '') = ANY($${params.length + 1}::text[]))`;
+    const archivedCondition = `(COALESCE(status, '') = ANY($${params.length + 1}::text[]) OR COALESCE(crm_status, '') = ANY($${params.length + 1}::text[]))`;
+    const statsParams = [...params, ARCHIVED_LEAD_STATUSES];
 
     const result = await pool.query(
       `SELECT
-        COUNT(*) AS total,
-        COUNT(CASE WHEN contact_person IS NOT NULL OR managing_director IS NOT NULL THEN 1 END) AS asp_found,
-        COUNT(CASE WHEN findymail_email IS NOT NULL OR email IS NOT NULL OR final_email IS NOT NULL THEN 1 END) AS email_found,
-        COUNT(CASE WHEN priority = 'A' THEN 1 END) AS a_leads,
-        ROUND(AVG(opportunity_score)) AS avg_score,
-        COUNT(CASE WHEN video_status IN ('completed', 'ready') OR video_url IS NOT NULL THEN 1 END) AS videos,
-        COUNT(CASE WHEN outreach_status IN ('sent', 'active', 'email_sent', 'email_opened', 'email_clicked', 'replied') OR status = 'outreach_active' THEN 1 END) AS outreach_sent
+        COUNT(CASE WHEN ${activeCondition} THEN 1 END) AS total,
+        COUNT(CASE WHEN ${activeCondition} AND (contact_person IS NOT NULL OR managing_director IS NOT NULL) THEN 1 END) AS asp_found,
+        COUNT(CASE WHEN ${activeCondition} AND (findymail_email IS NOT NULL OR email IS NOT NULL OR final_email IS NOT NULL) THEN 1 END) AS email_found,
+        COUNT(CASE WHEN ${activeCondition} AND priority = 'A' THEN 1 END) AS a_leads,
+        ROUND(AVG(CASE WHEN ${activeCondition} THEN opportunity_score END)) AS avg_score,
+        COUNT(CASE WHEN ${activeCondition} AND (video_status IN ('completed', 'ready') OR video_url IS NOT NULL) THEN 1 END) AS videos,
+        COUNT(CASE WHEN ${activeCondition} AND (outreach_status IN ('sent', 'active', 'email_sent', 'email_opened', 'email_clicked', 'replied') OR status = 'outreach_active') THEN 1 END) AS outreach_sent,
+        COUNT(CASE WHEN ${archivedCondition} THEN 1 END) AS archived
        FROM leads ${where}`,
-      params
+      statsParams
     );
 
     const row = result.rows[0];
@@ -997,7 +1026,8 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
       a_leads: parseInt(row.a_leads, 10) || 0,
       avg_score: parseInt(row.avg_score, 10) || 0,
       videos: parseInt(row.videos, 10) || 0,
-      outreach_sent: parseInt(row.outreach_sent, 10) || 0
+      outreach_sent: parseInt(row.outreach_sent, 10) || 0,
+      archived: parseInt(row.archived, 10) || 0
     });
   } catch (error) {
     console.error("[leads/stats]", error);

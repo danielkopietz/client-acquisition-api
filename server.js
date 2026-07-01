@@ -19,6 +19,8 @@ const RESET_SECRET = process.env.RESET_SECRET || "";
 
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
+const N8N_RC360_SCAN_WEBHOOK_URL = process.env.N8N_RC360_SCAN_WEBHOOK_URL || "";
+const N8N_RC360_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_RC360_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
 // Company 3: gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
@@ -141,8 +143,15 @@ function getSelectedLeadSplit(policy, leadIds) {
 const COMPANY_IDS = Object.freeze({
   BRAND4SOCIAL: 2,
   VIRALITYFILMS: 3,
-  COMPANY4_RECRUITING: 4
+  COMPANY4_RECRUITING: 4,
+  RC360: 6
 });
+
+const SALES_CRM_COMPANY_IDS = Object.freeze([
+  COMPANY_IDS.VIRALITYFILMS,
+  COMPANY_IDS.COMPANY4_RECRUITING,
+  COMPANY_IDS.RC360
+]);
 
 const ARCHIVED_LEAD_STATUSES = Object.freeze([
   "archived",
@@ -195,6 +204,28 @@ function getSelectedAnalysisPolicy(companyId) {
       creditsMode: "video_only",
       allowedStatuses: ["new", "no_email", "ready", "enriched", "contact_confirmed"],
       webhookUrl: N8N_C4_WF02_SELECTED_WEBHOOK_URL
+    };
+  }
+
+  if (id === COMPANY_IDS.RC360) {
+    return {
+      key: "rc360",
+      enabled: true,
+      maxLeads: 50,
+      requiresCallApproval: false,
+      allowedStatuses: [
+        "hubspot_imported",
+        "new",
+        "no_email",
+        "ready",
+        "outreach_failed",
+        "contact_confirmed",
+        "ready_for_analysis",
+        "called",
+        "approved",
+        "enriched"
+      ],
+      webhookUrl: N8N_RC360_WF02_SELECTED_WEBHOOK_URL || `${N8N_BASE}/rc360-run-selected-outreach`
     };
   }
 
@@ -560,16 +591,21 @@ app.post("/scans", checkJwt, async (req, res) => {
 
     let webhookResult = { sent: false };
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
+    const isRC360Scan = Number(companyId) === COMPANY_IDS.RC360;
 
-    if (isVFScan) {
-      const minEmployees = parsePositiveInt(req.body.min_employees, 51, 100000);
-      const maxEmployees = parsePositiveInt(req.body.max_employees, 200, 100000);
+    if (isVFScan || isRC360Scan) {
+      const minEmployees = isVFScan
+        ? parsePositiveInt(req.body.min_employees, 51, 100000)
+        : parsePositiveInt(req.body.min_employees, 1, 100000);
+      const maxEmployees = isVFScan
+        ? parsePositiveInt(req.body.max_employees, 200, 100000)
+        : parsePositiveInt(req.body.max_employees, 100000, 100000);
       const cityOverride = String(req.body.city || "").trim();
-      const source = String(req.body.source || "apollo_outscraper").trim();
-      const canonicalVfScanUrl = `${N8N_BASE}/vf-maps-scraper`;
-      const vfScanUrls = [...new Set([
-        process.env.N8N_VF_SCAN_WEBHOOK_URL,
-        canonicalVfScanUrl
+      const source = String(req.body.source || (isVFScan ? "apollo_outscraper" : "implisense_serper")).trim();
+      const canonicalScanUrl = `${N8N_BASE}/${isVFScan ? "vf-maps-scraper" : "rc360-dashboard-scan"}`;
+      const scanUrls = [...new Set([
+        isVFScan ? process.env.N8N_VF_SCAN_WEBHOOK_URL : N8N_RC360_SCAN_WEBHOOK_URL,
+        canonicalScanUrl
       ].filter(Boolean))];
 
       if (minEmployees > maxEmployees) {
@@ -584,7 +620,7 @@ app.post("/scans", checkJwt, async (req, res) => {
 
       const payload = {
         scan_id: newScan.id,
-        company_id: COMPANY_IDS.VIRALITYFILMS,
+        company_id: isVFScan ? COMPANY_IDS.VIRALITYFILMS : COMPANY_IDS.RC360,
         industry: newScan.industry,
         region: newScan.region,
         city: cityOverride || null,
@@ -594,12 +630,12 @@ app.post("/scans", checkJwt, async (req, res) => {
         source
       };
 
-      scanStage = "start_company3_workflow";
+      scanStage = isVFScan ? "start_company3_workflow" : "start_company6_workflow";
       const workflowAttempts = [];
 
-      for (const vfScanUrl of vfScanUrls) {
+      for (const scanUrl of scanUrls) {
         try {
-          const webhookResponse = await safeFetch(vfScanUrl, {
+          const webhookResponse = await safeFetch(scanUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -610,7 +646,7 @@ app.post("/scans", checkJwt, async (req, res) => {
           const responseText = await webhookResponse.text();
 
           workflowAttempts.push({
-            url: vfScanUrl,
+            url: scanUrl,
             status: webhookResponse.status,
             details: responseText.slice(0, 500)
           });
@@ -619,14 +655,14 @@ app.post("/scans", checkJwt, async (req, res) => {
             webhookResult = {
               sent: true,
               status: webhookResponse.status,
-              mode: "vf-maps-scraper",
-              url: vfScanUrl
+              mode: isVFScan ? "vf-maps-scraper" : "rc360-dashboard-scan",
+              url: scanUrl
             };
             break;
           }
         } catch (webhookError) {
           workflowAttempts.push({
-            url: vfScanUrl,
+            url: scanUrl,
             error: webhookError.message
           });
         }
@@ -639,7 +675,9 @@ app.post("/scans", checkJwt, async (req, res) => {
         ).catch(() => {});
 
         return res.status(502).json({
-          error: "Company-3-Workflow konnte nicht gestartet werden.",
+          error: isVFScan
+            ? "Company-3-Workflow konnte nicht gestartet werden."
+            : "Company-6-Workflow konnte nicht gestartet werden.",
           stage: scanStage,
           attempts: workflowAttempts
         });
@@ -746,8 +784,6 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
 
     const company = companyResult.rows[0];
     const policy = getSelectedAnalysisPolicy(companyId);
-    const isVFCompany = policy.key === "viralityfilms";
-
     if (!policy.enabled) {
       return res.status(403).json({
         success: false,
@@ -1038,7 +1074,7 @@ app.get("/leads/stats", checkJwt, async (req, res) => {
 app.get("/leads/reminders/due", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    if (![COMPANY_IDS.VIRALITYFILMS, COMPANY_IDS.COMPANY4_RECRUITING].includes(Number(companyId))) {
+    if (!SALES_CRM_COMPANY_IDS.includes(Number(companyId))) {
       return res.json([]);
     }
 
@@ -1137,10 +1173,7 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       owner, next_step, follow_up
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
-    const supportsSalesCrm = [
-      COMPANY_IDS.VIRALITYFILMS,
-      COMPANY_IDS.COMPANY4_RECRUITING
-    ].includes(Number(companyId));
+    const supportsSalesCrm = SALES_CRM_COMPANY_IDS.includes(Number(companyId));
     const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
     const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
     const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");

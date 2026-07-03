@@ -801,7 +801,7 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
       });
     }
 
-    const { lead_ids, requested_by } = req.body;
+    const { lead_ids, requested_by, campaign_name, campaign_segment, campaign_offer } = req.body;
 
     if (!Array.isArray(lead_ids) || lead_ids.length === 0) {
       return res.status(400).json({
@@ -945,10 +945,25 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
         });
       }
     } else {
+      const k1CampaignName = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+        ? String(campaign_name || "").trim()
+        : "";
+      const k1CampaignSegment = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+        ? String(campaign_segment || "").trim()
+        : "";
+      const k1CampaignOffer = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+        ? String(campaign_offer || "").trim()
+        : "";
       requests.push({
         company_id: companyId,
         lead_ids: uniqueLeadIds,
-        requested_by: requestedByValue
+        requested_by: requestedByValue,
+        selection_batch_id: k1CampaignName
+          ? `k1_${Date.now()}_${k1CampaignName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40)}`
+          : undefined,
+        campaign_name: k1CampaignName || undefined,
+        campaign_segment: k1CampaignSegment || undefined,
+        campaign_offer: k1CampaignOffer || undefined
       });
     }
 

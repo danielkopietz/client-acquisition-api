@@ -761,6 +761,8 @@ app.post("/contacts/import", checkJwt, async (req, res) => {
     }
     const csv = typeof req.body?.csv === "string" ? req.body.csv : "";
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    const importListName = String(req.body?.list_name || req.body?.import_list_name || req.body?.filename || "HubSpot CSV Import").trim();
+    const importListKey = `k1_import_${importListName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 54) || "hubspot_csv"}`;
     if (!csv && !rows) {
       return res.status(400).json({ success: false, message: "CSV-Text oder rows-Array fehlt." });
     }
@@ -773,6 +775,8 @@ app.post("/contacts/import", checkJwt, async (req, res) => {
       body: JSON.stringify({
         company_id: COMPANY_IDS.KOPIETZ_KI,
         filename: req.body?.filename || null,
+        list_name: importListName,
+        list_key: importListKey,
         csv,
         rows
       })
@@ -1058,7 +1062,7 @@ app.get("/leads", checkJwt, async (req, res) => {
         website_score, opportunity_score, priority, sales_hook, final_sales_hook,
         audit_summary, marketing_analysis, compliment,
         weakness_tags, recommended_services, recommended_channel, score_breakdown,
-        channel, status, crm_status, notes,
+        channel, status, crm_status, source_pipeline, notes,
         crm_owner AS owner, crm_next_step AS next_step, crm_follow_up AS follow_up,
         call_approved, call_notes,
         email, phone, contact_person, managing_director,

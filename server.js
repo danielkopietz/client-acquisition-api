@@ -17,6 +17,8 @@ const N8N_BASE = process.env.N8N_BASE_URL || "https://automatisierung.automatisi
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
 
+const N8N_K1_WF01_IMPORT_WEBHOOK_URL = process.env.N8N_K1_WF01_IMPORT_WEBHOOK_URL || `${N8N_BASE}/k1-hubspot-contacts-import`;
+const N8N_K1_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_K1_WF02_SELECTED_WEBHOOK_URL || process.env.N8N_K1_WF02_WEBHOOK_URL || `${N8N_BASE}/k1-selected-leads`;
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_RC360_SCAN_WEBHOOK_URL = process.env.N8N_RC360_SCAN_WEBHOOK_URL || "";
@@ -27,6 +29,7 @@ const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 const INSTANTLY_API_BASE_URL = (process.env.INSTANTLY_API_BASE_URL || "https://api.instantly.ai/api/v2").replace(/\/+$/, "");
 const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
 const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
+const INSTANTLY_K1_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_K1_RESEND_SUBSEQUENCE_ID || INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -141,6 +144,7 @@ function getSelectedLeadSplit(policy, leadIds) {
  * nutzen dieselbe UI-Funktion, aber getrennte Prozesse.
  */
 const COMPANY_IDS = Object.freeze({
+  KOPIETZ_KI: 1,
   BRAND4SOCIAL: 2,
   VIRALITYFILMS: 3,
   COMPANY4_RECRUITING: 4,
@@ -148,6 +152,7 @@ const COMPANY_IDS = Object.freeze({
 });
 
 const SALES_CRM_COMPANY_IDS = Object.freeze([
+  COMPANY_IDS.KOPIETZ_KI,
   COMPANY_IDS.VIRALITYFILMS,
   COMPANY_IDS.COMPANY4_RECRUITING,
   COMPANY_IDS.RC360
@@ -170,6 +175,17 @@ function getArchiveMode(value) {
 
 function getSelectedAnalysisPolicy(companyId) {
   const id = Number(companyId);
+
+  if (id === COMPANY_IDS.KOPIETZ_KI) {
+    return {
+      key: "kopietz_ki_solution",
+      enabled: true,
+      maxLeads: 50,
+      requiresCallApproval: false,
+      allowedStatuses: ["hubspot_imported", "new", "no_email", "ready", "enriched", "contact_confirmed", "ready_for_analysis", "called", "approved"],
+      webhookUrl: N8N_K1_WF02_SELECTED_WEBHOOK_URL
+    };
+  }
 
   if (id === COMPANY_IDS.BRAND4SOCIAL) {
     return {
@@ -737,6 +753,43 @@ app.post("/scan/start", checkJwt, async (req, res) => {
   app._router.handle(req, res, () => {});
 });
 
+app.post("/contacts/import", checkJwt, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (Number(companyId) !== COMPANY_IDS.KOPIETZ_KI) {
+      return res.status(403).json({ success: false, message: "CSV-Import ist nur für Company 1 aktiviert." });
+    }
+    const csv = typeof req.body?.csv === "string" ? req.body.csv : "";
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!csv && !rows) {
+      return res.status(400).json({ success: false, message: "CSV-Text oder rows-Array fehlt." });
+    }
+    const webhookRes = await safeFetch(N8N_K1_WF01_IMPORT_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": N8N_INTERNAL_TOKEN
+      },
+      body: JSON.stringify({
+        company_id: COMPANY_IDS.KOPIETZ_KI,
+        filename: req.body?.filename || null,
+        csv,
+        rows
+      })
+    });
+    const text = await webhookRes.text();
+    let payload = null;
+    try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text }; }
+    if (!webhookRes.ok) {
+      return res.status(500).json({ success: false, message: "WF01 Import konnte nicht gestartet werden.", details: payload });
+    }
+    return res.json({ success: true, ...(payload || {}) });
+  } catch (error) {
+    console.error("[contacts/import]", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post("/analysis/start-selected", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
@@ -1173,12 +1226,13 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       owner, next_step, follow_up
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
+    const isKopietzCompany = Number(companyId) === COMPANY_IDS.KOPIETZ_KI;
     const supportsSalesCrm = SALES_CRM_COMPANY_IDS.includes(Number(companyId));
     const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
     const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
     const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");
     const hasCrmStatus = Object.prototype.hasOwnProperty.call(req.body, "crm_status");
-    const shouldSyncManualEmail = isViralityFilmsCompany &&
+    const shouldSyncManualEmail = (isViralityFilmsCompany || isKopietzCompany) &&
       Object.prototype.hasOwnProperty.call(req.body, "email");
 
     if (supportsSalesCrm && crm_status != null) {
@@ -1355,10 +1409,11 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
 app.post("/instantly/resend", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    if (Number(companyId) !== COMPANY_IDS.VIRALITYFILMS) {
+    const supportsResend = [COMPANY_IDS.KOPIETZ_KI, COMPANY_IDS.VIRALITYFILMS].includes(Number(companyId));
+    if (!supportsResend) {
       return res.status(403).json({
         success: false,
-        message: "Der E-Mail-Wiederholungsversand ist nur für Company 3 verfügbar."
+        message: "Der E-Mail-Wiederholungsversand ist für diese Company nicht verfügbar."
       });
     }
 
@@ -1367,10 +1422,13 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(400).json({ success: false, message: "Gültige lead_id fehlt." });
     }
 
-    if (!INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
+    const resendSubsequenceId = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+      ? INSTANTLY_K1_RESEND_SUBSEQUENCE_ID
+      : INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
+    if (!resendSubsequenceId) {
       return res.status(500).json({
         success: false,
-        message: "INSTANTLY_VF_RESEND_SUBSEQUENCE_ID fehlt im Backend."
+        message: "Instantly Resend Subsequence ID fehlt im Backend."
       });
     }
 
@@ -1396,7 +1454,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
     }
 
-    if (lead.call_approved !== true) {
+    if (Number(companyId) === COMPANY_IDS.VIRALITYFILMS && lead.call_approved !== true) {
       return res.status(400).json({
         success: false,
         message: "Für diesen Lead liegt keine telefonische E-Mail-Freigabe vor."
@@ -1477,7 +1535,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
 
     // Erneutes Klicken ist erlaubt: Falls der Lead noch in derselben
     // Resend-Subsequence steckt, wird er zuerst entfernt und dann neu gestartet.
-    if (instantlyLead.subsequence_id === INSTANTLY_VF_RESEND_SUBSEQUENCE_ID) {
+    if (instantlyLead.subsequence_id === resendSubsequenceId) {
       await instantlyRequest("/leads/subsequence/remove", {
         method: "POST",
         body: { id: instantlyLead.id }
@@ -1488,7 +1546,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       method: "POST",
       body: {
         id: instantlyLead.id,
-        subsequence_id: INSTANTLY_VF_RESEND_SUBSEQUENCE_ID
+        subsequence_id: resendSubsequenceId
       }
     });
 

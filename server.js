@@ -8,7 +8,16 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "15mb" }));
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large") {
+    return res.status(413).json({
+      success: false,
+      message: "Upload zu gross. Bitte kleinere Datei hochladen oder JSON_BODY_LIMIT im Backend erhoehen."
+    });
+  }
+  return next(err);
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -1025,7 +1034,8 @@ app.post("/analysis/start-selected", checkJwt, async (req, res) => {
 app.get("/leads", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
-    const limit = parsePositiveInt(req.query.limit, 500, 1000);
+    const maxLeadLimit = Number(companyId) === COMPANY_IDS.KOPIETZ_KI ? 8000 : 1000;
+    const limit = parsePositiveInt(req.query.limit, 500, maxLeadLimit);
     const page = parsePositiveInt(req.query.page, 1);
     const offset = (page - 1) * limit;
     const scan_id = req.query.scan_id;

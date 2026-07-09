@@ -34,11 +34,12 @@ const N8N_RC360_SCAN_WEBHOOK_URL = process.env.N8N_RC360_SCAN_WEBHOOK_URL || "";
 const N8N_RC360_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_RC360_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
-// Company 3: gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
+// Gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
 const INSTANTLY_API_BASE_URL = (process.env.INSTANTLY_API_BASE_URL || "https://api.instantly.ai/api/v2").replace(/\/+$/, "");
 const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
 const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
-const INSTANTLY_K1_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_K1_RESEND_SUBSEQUENCE_ID || INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
+const INSTANTLY_K1_CAMPAIGN_ID = process.env.INSTANTLY_K1_CAMPAIGN_ID || "a1c7c772-c306-402b-b795-c6df0663ed41";
+const INSTANTLY_K1_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_K1_RESEND_SUBSEQUENCE_ID || "2d62e8f0-9c8b-487a-8614-8563b86b9366";
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -87,6 +88,90 @@ async function instantlyRequest(path, options = {}) {
   }
 
   return payload;
+}
+
+function cleanString(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeEmail(value) {
+  const email = cleanString(value).toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
+}
+
+function splitPersonName(value) {
+  const parts = cleanString(value).split(/\s+/).filter(Boolean);
+  return {
+    firstName: parts[0] || "",
+    lastName: parts.slice(1).join(" ")
+  };
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const text = cleanString(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function buildInstantlyLeadPayload(lead, overrides = {}) {
+  const contactPerson = firstNonEmpty(
+    overrides.contact_person,
+    lead.contact_person,
+    lead.managing_director,
+    [lead.inhaber_vorname, lead.inhaber_nachname].filter(Boolean).join(" ")
+  );
+  const fallbackName = splitPersonName(contactPerson);
+  const firstName = firstNonEmpty(overrides.first_name, lead.inhaber_vorname, fallbackName.firstName);
+  const lastName = firstNonEmpty(overrides.last_name, lead.inhaber_nachname, fallbackName.lastName);
+  const email = normalizeEmail(firstNonEmpty(overrides.email, lead.email, lead.final_email, lead.findymail_email));
+  const companyName = firstNonEmpty(overrides.lead_name, lead.lead_name, lead.company_name);
+  const website = firstNonEmpty(lead.website, lead.website_url, lead._website_url, lead.domain ? `https://${lead.domain}` : "");
+  const videoUrl = firstNonEmpty(lead.video_url, lead.pitchlane_video_url);
+  const thumbnailUrl = firstNonEmpty(lead.thumbnail_url, lead.pitchlane_thumbnail_url, lead.pitchlane_thumbnail_gif_url, lead.pitchlane_thumbnail_png_url);
+  const thumbnailEmbed = firstNonEmpty(lead.thumbnail_embed, lead.pitchlane_thumbnail_embed);
+  const language = firstNonEmpty(lead.sprache, "de");
+  const salutation = contactPerson
+    ? (language === "en" ? `Hello ${contactPerson}` : `Guten Tag ${contactPerson}`)
+    : (language === "en" ? "Hello" : "Guten Tag");
+
+  return {
+    campaign: firstNonEmpty(overrides.campaign_id, lead.instantly_campaign_id, INSTANTLY_K1_CAMPAIGN_ID),
+    email,
+    first_name: firstName,
+    last_name: lastName,
+    company_name: companyName,
+    website,
+    phone: firstNonEmpty(overrides.phone, lead.phone),
+    personalization: firstNonEmpty(lead.sales_hook, lead.compliment, lead.personalization_summary),
+    custom_variables: {
+      contact_person: contactPerson,
+      salutation,
+      city: firstNonEmpty(lead.city),
+      region: firstNonEmpty(lead.region),
+      land: firstNonEmpty(lead.country, lead.land, "DE"),
+      sprache: language,
+      industry: firstNonEmpty(lead.industry),
+      priority: firstNonEmpty(lead.priority),
+      opportunity_score: lead.opportunity_score ?? null,
+      video_url: videoUrl,
+      thumbnail_url: thumbnailUrl,
+      thumbnail_embed: thumbnailEmbed,
+      pitchlane_thumbnail_embed: thumbnailEmbed,
+      sales_hook: firstNonEmpty(lead.sales_hook, lead.final_sales_hook),
+      marketing_analysis: firstNonEmpty(lead.marketing_analysis, lead.personalization_summary),
+      personalization_summary: firstNonEmpty(lead.personalization_summary),
+      recruiting_signal: firstNonEmpty(lead.recruiting_signal),
+      personalization_confidence: firstNonEmpty(lead.personalization_confidence),
+      job_title: firstNonEmpty(lead.job_title),
+      video_hook: firstNonEmpty(lead.video_hook, lead.final_sales_hook),
+      company_summary: firstNonEmpty(lead.company_summary),
+      sales_process_signal: firstNonEmpty(lead.sales_process_signal),
+      likely_use_case: firstNonEmpty(lead.likely_use_case),
+      demo_reason: firstNonEmpty(lead.demo_reason)
+    }
+  };
 }
 
 const checkJwt = auth({
@@ -1438,6 +1523,8 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
 app.post("/instantly/resend", checkJwt, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
+    const isKopietzCompany = Number(companyId) === COMPANY_IDS.KOPIETZ_KI;
+    const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
     const supportsResend = [COMPANY_IDS.KOPIETZ_KI, COMPANY_IDS.VIRALITYFILMS].includes(Number(companyId));
     if (!supportsResend) {
       return res.status(403).json({
@@ -1451,7 +1538,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(400).json({ success: false, message: "Gültige lead_id fehlt." });
     }
 
-    const resendSubsequenceId = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+    const resendSubsequenceId = isKopietzCompany
       ? INSTANTLY_K1_RESEND_SUBSEQUENCE_ID
       : INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
     if (!resendSubsequenceId) {
@@ -1461,10 +1548,14 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       });
     }
 
+    const requestedContactPerson = cleanString(req.body?.contact_person);
+    const requestedLeadName = firstNonEmpty(req.body?.lead_name, req.body?.company_name);
+    const requestedEmail = normalizeEmail(req.body?.email);
+    const requestedPhone = cleanString(req.body?.phone);
+    const requestedNameParts = splitPersonName(requestedContactPerson);
+
     const leadResult = await pool.query(
-      `SELECT id, lead_name, email, final_email, findymail_email,
-              instantly_lead_id, instantly_campaign_id,
-              outreach_status, outreach_sent_at, status, call_approved
+      `SELECT *, lead_name AS company_name
        FROM leads
        WHERE id = $1 AND company_id = $2`,
       [leadId, companyId]
@@ -1474,16 +1565,30 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       return res.status(404).json({ success: false, message: "Lead nicht gefunden." });
     }
 
-    const lead = leadResult.rows[0];
-    const email = String(lead.email || lead.final_email || lead.findymail_email || "")
-      .trim()
-      .toLowerCase();
+    const originalLead = leadResult.rows[0];
+    const lead = {
+      ...originalLead,
+      lead_name: requestedLeadName || originalLead.lead_name,
+      company_name: requestedLeadName || originalLead.company_name || originalLead.lead_name,
+      contact_person: requestedContactPerson || originalLead.contact_person,
+      managing_director: requestedContactPerson || originalLead.managing_director,
+      inhaber_vorname: requestedNameParts.firstName || originalLead.inhaber_vorname,
+      inhaber_nachname: requestedNameParts.lastName || originalLead.inhaber_nachname,
+      email: requestedEmail || originalLead.email,
+      final_email: requestedEmail || originalLead.final_email,
+      phone: requestedPhone || originalLead.phone,
+      instantly_campaign_id: isKopietzCompany
+        ? firstNonEmpty(originalLead.instantly_campaign_id, INSTANTLY_K1_CAMPAIGN_ID)
+        : originalLead.instantly_campaign_id
+    };
+
+    const email = normalizeEmail(firstNonEmpty(lead.email, lead.final_email, lead.findymail_email));
 
     if (!email) {
       return res.status(400).json({ success: false, message: "Keine E-Mail-Adresse hinterlegt." });
     }
 
-    if (Number(companyId) === COMPANY_IDS.VIRALITYFILMS && lead.call_approved !== true) {
+    if (isViralityFilmsCompany && lead.call_approved !== true) {
       return res.status(400).json({
         success: false,
         message: "Für diesen Lead liegt keine telefonische E-Mail-Freigabe vor."
@@ -1507,12 +1612,30 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       resendableStatuses.has(String(lead.status || "").toLowerCase())
     );
 
-    if (!wasAlreadySent) {
+    if (!wasAlreadySent && !isKopietzCompany) {
       return res.status(409).json({
         success: false,
         message: "Für diesen Lead ist noch kein Erstversand dokumentiert."
       });
     }
+
+    const instantlyPayload = buildInstantlyLeadPayload(lead, {
+      campaign_id: lead.instantly_campaign_id,
+      email,
+      contact_person: lead.contact_person,
+      first_name: lead.inhaber_vorname,
+      last_name: lead.inhaber_nachname,
+      lead_name: lead.lead_name,
+      phone: lead.phone
+    });
+
+    if (!instantlyPayload.campaign && isKopietzCompany) {
+      instantlyPayload.campaign = INSTANTLY_K1_CAMPAIGN_ID;
+    }
+
+    const patchPayload = { ...instantlyPayload };
+    delete patchPayload.campaign;
+    delete patchPayload.email;
 
     let instantlyLead = null;
     const storedInstantlyLeadId = String(lead.instantly_lead_id || "").trim();
@@ -1525,11 +1648,22 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       }
     }
 
-    if (
-      instantlyLead?.id &&
-      String(instantlyLead.email || "").trim().toLowerCase() !== email
-    ) {
+    if (instantlyLead?.id && normalizeEmail(instantlyLead.email) !== email) {
       instantlyLead = null;
+    }
+
+    if (instantlyLead?.id) {
+      try {
+        instantlyLead = await instantlyRequest(`/leads/${encodeURIComponent(instantlyLead.id)}`, {
+          method: "PATCH",
+          body: patchPayload
+        });
+      } catch (error) {
+        if (!isKopietzCompany || ![400, 404, 409, 422].includes(Number(error.statusCode))) {
+          throw error;
+        }
+        instantlyLead = null;
+      }
     }
 
     // Ältere Datensätze enthalten teilweise noch keine Instantly-v2-ID.
@@ -1548,17 +1682,63 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       const candidates = Array.isArray(lookupResult?.items) ? lookupResult.items : [];
 
       instantlyLead = candidates.find(item =>
-        String(item.email || "").trim().toLowerCase() === email &&
+        normalizeEmail(item.email) === email &&
         (!lead.instantly_campaign_id || item.campaign === lead.instantly_campaign_id)
       ) || candidates.find(item =>
-        String(item.email || "").trim().toLowerCase() === email
+        normalizeEmail(item.email) === email
       ) || null;
+
+      if (instantlyLead?.id) {
+        instantlyLead = await instantlyRequest(`/leads/${encodeURIComponent(instantlyLead.id)}`, {
+          method: "PATCH",
+          body: patchPayload
+        });
+      }
+    }
+
+    if (!instantlyLead?.id && isKopietzCompany) {
+      try {
+        instantlyLead = await instantlyRequest("/leads", {
+          method: "POST",
+          body: {
+            ...instantlyPayload,
+            campaign: firstNonEmpty(instantlyPayload.campaign, INSTANTLY_K1_CAMPAIGN_ID),
+            skip_if_in_workspace: false,
+            skip_if_in_campaign: false
+          }
+        });
+      } catch (error) {
+        if (![400, 409, 422].includes(Number(error.statusCode))) throw error;
+
+        const lookupResult = await instantlyRequest("/leads/list", {
+          method: "POST",
+          body: {
+            contacts: [email],
+            limit: 20,
+            distinct_contacts: false
+          }
+        });
+        const candidates = Array.isArray(lookupResult?.items) ? lookupResult.items : [];
+        instantlyLead = candidates.find(item =>
+          normalizeEmail(item.email) === email &&
+          (!lead.instantly_campaign_id || item.campaign === lead.instantly_campaign_id)
+        ) || candidates.find(item => normalizeEmail(item.email) === email) || null;
+
+        if (instantlyLead?.id) {
+          instantlyLead = await instantlyRequest(`/leads/${encodeURIComponent(instantlyLead.id)}`, {
+            method: "PATCH",
+            body: patchPayload
+          });
+        }
+      }
     }
 
     if (!instantlyLead?.id) {
       return res.status(409).json({
         success: false,
-        message: "Der bestehende Kontakt wurde in Instantly nicht gefunden."
+        message: isKopietzCompany
+          ? "Der Kontakt konnte in Instantly nicht angelegt oder gefunden werden."
+          : "Der bestehende Kontakt wurde in Instantly nicht gefunden."
       });
     }
 
@@ -1581,20 +1761,44 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
 
     const requestedAt = new Date().toISOString();
     const requestedBy = getUserEmail(req) || "dashboard";
-    const note = `E-Mail-Wiederholungsversand über Instantly angefordert am ${requestedAt} von ${requestedBy}.`;
+    const contactLabel = lead.contact_person ? `${lead.contact_person} <${email}>` : email;
+    const note = `E-Mail-Wiederholungsversand über Instantly angefordert am ${requestedAt} von ${requestedBy} an ${contactLabel}.`;
 
     try {
       await pool.query(
         `UPDATE leads
-         SET instantly_lead_id = COALESCE(NULLIF(instantly_lead_id, ''), $1::text),
+         SET instantly_lead_id = $1::text,
+             instantly_campaign_id = COALESCE(NULLIF($2::text, ''), instantly_campaign_id),
+             email = COALESCE(NULLIF($3::text, ''), email),
+             final_email = COALESCE(NULLIF($3::text, ''), final_email),
+             final_email_type = CASE
+               WHEN NULLIF($3::text, '') IS NOT NULL THEN 'manual'
+               ELSE final_email_type
+             END,
+             contact_person = COALESCE(NULLIF($4::text, ''), contact_person),
+             managing_director = COALESCE(NULLIF($4::text, ''), managing_director),
+             inhaber_vorname = COALESCE(NULLIF($5::text, ''), inhaber_vorname),
+             inhaber_nachname = COALESCE(NULLIF($6::text, ''), inhaber_nachname),
+             phone = COALESCE(NULLIF($7::text, ''), phone),
              outreach_notes = CONCAT_WS(
                E'\n',
                NULLIF(outreach_notes, ''),
-               $2::text
+               $8::text
              ),
              updated_at = NOW()
-         WHERE id = $3::integer AND company_id = $4::integer`,
-        [String(instantlyLead.id), note, leadId, companyId]
+         WHERE id = $9::integer AND company_id = $10::integer`,
+        [
+          String(instantlyLead.id),
+          instantlyLead.campaign || lead.instantly_campaign_id || "",
+          email,
+          lead.contact_person || "",
+          lead.inhaber_vorname || "",
+          lead.inhaber_nachname || "",
+          lead.phone || "",
+          note,
+          leadId,
+          companyId
+        ]
       );
     } catch (logError) {
       // Der Instantly-Aufruf war bereits erfolgreich. Ein optionaler
@@ -1606,9 +1810,15 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       success: true,
       lead_id: leadId,
       instantly_lead_id: resendResult?.id || instantlyLead.id,
+      instantly_campaign_id: instantlyLead.campaign || lead.instantly_campaign_id || "",
+      subsequence_id: resendSubsequenceId,
       email,
+      contact_person: lead.contact_person || "",
+      first_name: lead.inhaber_vorname || "",
+      last_name: lead.inhaber_nachname || "",
+      phone: lead.phone || "",
       requested_at: requestedAt,
-      message: "Erneuter E-Mail-Versand wurde bei Instantly angefordert."
+      message: "Erneuter E-Mail-Versand wurde mit aktuellen Kontaktdaten bei Instantly angefordert."
     });
   } catch (error) {
     console.error("[instantly/resend]", error);

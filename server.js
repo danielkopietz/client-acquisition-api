@@ -1353,6 +1353,11 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
       const allowedStatuses = new Set([
         "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"
       ]);
+      if (isKopietzCompany) {
+        ["email_sent", "email_opened", "bounced", "video_opened"].forEach(statusValue => {
+          allowedStatuses.add(statusValue);
+        });
+      }
       if (!allowedStatuses.has(String(crm_status))) {
         return res.status(400).json({ error: "Ungültiger CRM-Status." });
       }

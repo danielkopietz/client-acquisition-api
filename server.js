@@ -40,6 +40,8 @@ const INSTANTLY_API_KEY = process.env.INSTANTLY_API_KEY || "";
 const INSTANTLY_VF_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_VF_RESEND_SUBSEQUENCE_ID || "";
 const INSTANTLY_K1_CAMPAIGN_ID = process.env.INSTANTLY_K1_CAMPAIGN_ID || "a1c7c772-c306-402b-b795-c6df0663ed41";
 const INSTANTLY_K1_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_K1_RESEND_SUBSEQUENCE_ID || "2d62e8f0-9c8b-487a-8614-8563b86b9366";
+const INSTANTLY_RC360_CAMPAIGN_ID = process.env.INSTANTLY_RC360_CAMPAIGN_ID || "159d925c-44a0-48f9-a9df-cb7be8872bfd";
+const INSTANTLY_RC360_RESEND_SUBSEQUENCE_ID = process.env.INSTANTLY_RC360_RESEND_SUBSEQUENCE_ID || "f7cfcb85-e9fb-4e0b-9f77-2034fa0ce8a1";
 
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN || "dev-ompvmvxk02ucpm3p.us.auth0.com";
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE || "https://api.automatisierungen-ki.de";
@@ -1341,19 +1343,20 @@ app.patch("/leads/:id", checkJwt, async (req, res) => {
     } = req.body;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
     const isKopietzCompany = Number(companyId) === COMPANY_IDS.KOPIETZ_KI;
+    const isRC360Company = Number(companyId) === COMPANY_IDS.RC360;
     const supportsSalesCrm = SALES_CRM_COMPANY_IDS.includes(Number(companyId));
     const hasOwner = Object.prototype.hasOwnProperty.call(req.body, "owner");
     const hasNextStep = Object.prototype.hasOwnProperty.call(req.body, "next_step");
     const hasFollowUp = Object.prototype.hasOwnProperty.call(req.body, "follow_up");
     const hasCrmStatus = Object.prototype.hasOwnProperty.call(req.body, "crm_status");
-    const shouldSyncManualEmail = (isViralityFilmsCompany || isKopietzCompany) &&
+    const shouldSyncManualEmail = (isViralityFilmsCompany || isKopietzCompany || isRC360Company) &&
       Object.prototype.hasOwnProperty.call(req.body, "email");
 
     if (supportsSalesCrm && crm_status != null) {
       const allowedStatuses = new Set([
         "analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"
       ]);
-      if (isKopietzCompany) {
+      if (isKopietzCompany || isRC360Company) {
         ["email_sent", "email_opened", "bounced", "video_opened"].forEach(statusValue => {
           allowedStatuses.add(statusValue);
         });
@@ -1530,7 +1533,9 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
     const companyId = getCompanyId(req);
     const isKopietzCompany = Number(companyId) === COMPANY_IDS.KOPIETZ_KI;
     const isViralityFilmsCompany = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
-    const supportsResend = [COMPANY_IDS.KOPIETZ_KI, COMPANY_IDS.VIRALITYFILMS].includes(Number(companyId));
+    const isRC360Company = Number(companyId) === COMPANY_IDS.RC360;
+    const usesCompany1Resend = isKopietzCompany || isRC360Company;
+    const supportsResend = [COMPANY_IDS.KOPIETZ_KI, COMPANY_IDS.VIRALITYFILMS, COMPANY_IDS.RC360].includes(Number(companyId));
     if (!supportsResend) {
       return res.status(403).json({
         success: false,
@@ -1545,7 +1550,9 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
 
     const resendSubsequenceId = isKopietzCompany
       ? INSTANTLY_K1_RESEND_SUBSEQUENCE_ID
-      : INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
+      : isRC360Company
+        ? INSTANTLY_RC360_RESEND_SUBSEQUENCE_ID
+        : INSTANTLY_VF_RESEND_SUBSEQUENCE_ID;
     if (!resendSubsequenceId) {
       return res.status(500).json({
         success: false,
@@ -1582,8 +1589,8 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       email: requestedEmail || originalLead.email,
       final_email: requestedEmail || originalLead.final_email,
       phone: requestedPhone || originalLead.phone,
-      instantly_campaign_id: isKopietzCompany
-        ? firstNonEmpty(originalLead.instantly_campaign_id, INSTANTLY_K1_CAMPAIGN_ID)
+      instantly_campaign_id: usesCompany1Resend
+        ? firstNonEmpty(originalLead.instantly_campaign_id, isRC360Company ? INSTANTLY_RC360_CAMPAIGN_ID : INSTANTLY_K1_CAMPAIGN_ID)
         : originalLead.instantly_campaign_id
     };
 
@@ -1617,7 +1624,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       resendableStatuses.has(String(lead.status || "").toLowerCase())
     );
 
-    if (!wasAlreadySent && !isKopietzCompany) {
+    if (!wasAlreadySent && !usesCompany1Resend) {
       return res.status(409).json({
         success: false,
         message: "Für diesen Lead ist noch kein Erstversand dokumentiert."
@@ -1634,8 +1641,8 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       phone: lead.phone
     });
 
-    if (!instantlyPayload.campaign && isKopietzCompany) {
-      instantlyPayload.campaign = INSTANTLY_K1_CAMPAIGN_ID;
+    if (!instantlyPayload.campaign && usesCompany1Resend) {
+      instantlyPayload.campaign = isRC360Company ? INSTANTLY_RC360_CAMPAIGN_ID : INSTANTLY_K1_CAMPAIGN_ID;
     }
 
     const patchPayload = { ...instantlyPayload };
@@ -1664,7 +1671,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
           body: patchPayload
         });
       } catch (error) {
-        if (!isKopietzCompany || ![400, 404, 409, 422].includes(Number(error.statusCode))) {
+        if (!usesCompany1Resend || ![400, 404, 409, 422].includes(Number(error.statusCode))) {
           throw error;
         }
         instantlyLead = null;
@@ -1701,13 +1708,13 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
       }
     }
 
-    if (!instantlyLead?.id && isKopietzCompany) {
+    if (!instantlyLead?.id && usesCompany1Resend) {
       try {
         instantlyLead = await instantlyRequest("/leads", {
           method: "POST",
           body: {
             ...instantlyPayload,
-            campaign: firstNonEmpty(instantlyPayload.campaign, INSTANTLY_K1_CAMPAIGN_ID),
+            campaign: firstNonEmpty(instantlyPayload.campaign, isRC360Company ? INSTANTLY_RC360_CAMPAIGN_ID : INSTANTLY_K1_CAMPAIGN_ID),
             skip_if_in_workspace: false,
             skip_if_in_campaign: false
           }
@@ -1741,7 +1748,7 @@ app.post("/instantly/resend", checkJwt, async (req, res) => {
     if (!instantlyLead?.id) {
       return res.status(409).json({
         success: false,
-        message: isKopietzCompany
+        message: usesCompany1Resend
           ? "Der Kontakt konnte in Instantly nicht angelegt oder gefunden werden."
           : "Der bestehende Kontakt wurde in Instantly nicht gefunden."
       });

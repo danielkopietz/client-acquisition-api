@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 const { auth } = require("express-oauth2-jwt-bearer");
 
@@ -32,6 +33,7 @@ const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBH
 const N8N_C4_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_C4_WF02_SELECTED_WEBHOOK_URL || "";
 const N8N_RC360_SCAN_WEBHOOK_URL = process.env.N8N_RC360_SCAN_WEBHOOK_URL || "";
 const N8N_RC360_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_RC360_WF02_SELECTED_WEBHOOK_URL || "";
+const N8N_RC360_DIALFIRE_PREPARE_WEBHOOK_URL = process.env.N8N_RC360_DIALFIRE_PREPARE_WEBHOOK_URL || `${N8N_BASE}/rc360-dialfire-prepare-call`;
 const N8N_INTERNAL_TOKEN = process.env.N8N_INTERNAL_TOKEN || "";
 
 // Gezielter Wiederholungsversand ohne Pitchlane/WF02-Neustart.
@@ -181,6 +183,25 @@ const checkJwt = auth({
   issuerBaseURL: `https://${AUTH0_DOMAIN}/`,
   tokenSigningAlg: "RS256"
 });
+
+function secureStringEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""));
+  const rightBuffer = Buffer.from(String(right || ""));
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requireN8nInternalToken(req, res, next) {
+  if (!N8N_INTERNAL_TOKEN) {
+    return res.status(503).json({ success: false, message: "N8N_INTERNAL_TOKEN fehlt im Backend." });
+  }
+
+  const providedToken = req.get("x-internal-token");
+  if (!secureStringEqual(providedToken, N8N_INTERNAL_TOKEN)) {
+    return res.status(401).json({ success: false, message: "Ungültiger interner Token." });
+  }
+
+  return next();
+}
 
 function getCompanyId(req) {
   const payload = req.auth?.payload;
@@ -1184,6 +1205,11 @@ app.get("/leads", checkJwt, async (req, res) => {
         analysis_requested_at, analysis_started_at, analysis_batch_id, analysis_requested_by,
         instantly_lead_id, instantly_campaign_id,
         outreach_status, outreach_sent_at, outreach_completed_at,
+        dialfire_contact_id, dialfire_campaign_id, dialfire_task_name,
+        dialfire_external_ref, dialfire_last_status, dialfire_status_detail,
+        dialfire_agent, dialfire_call_requested_at, dialfire_call_requested_by,
+        dialfire_last_called_at, dialfire_call_duration_seconds,
+        dialfire_recording_url, dialfire_synced_at, dialfire_last_error,
         impressum_fetch_status, impressum_extraction_status,
         created_at, updated_at
        FROM leads
@@ -1326,6 +1352,274 @@ app.get("/leads/:id", checkJwt, async (req, res) => {
   } catch (error) {
     console.error("[leads/:id]", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// RC360 / Company 6: Kontakt in Dialfire anlegen oder aktualisieren und
+// anschließend den konfigurierten Dialfire-Arbeitsbereich öffnen.
+app.post("/leads/:id/dialfire/prepare", checkJwt, async (req, res) => {
+  const companyId = getCompanyId(req);
+  const leadId = Number(req.params.id);
+
+  if (Number(companyId) !== COMPANY_IDS.RC360) {
+    return res.status(403).json({ success: false, message: "Dialfire ist ausschließlich für Company 6 aktiviert." });
+  }
+  if (!Number.isInteger(leadId) || leadId <= 0) {
+    return res.status(400).json({ success: false, message: "Ungültige lead_id." });
+  }
+  if (!N8N_RC360_DIALFIRE_PREPARE_WEBHOOK_URL) {
+    return res.status(503).json({ success: false, message: "Dialfire-Workflow-URL fehlt im Backend." });
+  }
+  if (!N8N_INTERNAL_TOKEN) {
+    return res.status(503).json({ success: false, message: "N8N_INTERNAL_TOKEN fehlt im Backend." });
+  }
+
+  try {
+    const leadResult = await pool.query(
+      `SELECT *, lead_name AS company_name
+       FROM leads
+       WHERE id = $1 AND company_id = $2`,
+      [leadId, COMPANY_IDS.RC360]
+    );
+
+    if (!leadResult.rows.length) {
+      return res.status(404).json({ success: false, message: "Lead nicht gefunden." });
+    }
+
+    const lead = leadResult.rows[0];
+    const phone = cleanString(lead.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "Für diesen Lead ist keine Telefonnummer hinterlegt." });
+    }
+
+    const requestedBy = getUserEmail(req) || "dashboard";
+    const requestedAt = new Date().toISOString();
+
+    await pool.query(
+      `UPDATE leads
+       SET dialfire_call_requested_at = $1::timestamptz,
+           dialfire_call_requested_by = $2,
+           dialfire_last_error = NULL,
+           updated_at = NOW()
+       WHERE id = $3 AND company_id = $4`,
+      [requestedAt, requestedBy, leadId, COMPANY_IDS.RC360]
+    );
+
+    const webhookResponse = await safeFetch(N8N_RC360_DIALFIRE_PREPARE_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": N8N_INTERNAL_TOKEN
+      },
+      body: JSON.stringify({
+        company_id: COMPANY_IDS.RC360,
+        lead_id: leadId,
+        requested_by: requestedBy,
+        requested_at: requestedAt,
+        lead: {
+          id: lead.id,
+          lead_name: lead.lead_name,
+          company_name: lead.company_name || lead.lead_name,
+          contact_person: lead.contact_person || lead.managing_director || "",
+          first_name: lead.inhaber_vorname || "",
+          last_name: lead.inhaber_nachname || "",
+          email: lead.email || lead.final_email || lead.findymail_email || "",
+          phone,
+          website: lead.website || "",
+          industry: lead.industry || "",
+          region: lead.region || "",
+          street: lead.street || "",
+          postal_code: lead.postal_code || "",
+          city: lead.city || "",
+          priority: lead.priority || "",
+          opportunity_score: lead.opportunity_score ?? null,
+          sales_hook: lead.final_sales_hook || lead.sales_hook || "",
+          marketing_analysis: lead.marketing_analysis || "",
+          crm_owner: lead.crm_owner || "",
+          crm_status: lead.crm_status || "",
+          dialfire_contact_id: lead.dialfire_contact_id || "",
+          dialfire_external_ref: lead.dialfire_external_ref || ""
+        }
+      })
+    });
+
+    const responseText = await webhookResponse.text();
+    let workflowPayload = {};
+    try {
+      workflowPayload = responseText ? JSON.parse(responseText) : {};
+    } catch (_) {
+      workflowPayload = { details: responseText };
+    }
+
+    if (!webhookResponse.ok || workflowPayload.success === false) {
+      const details = workflowPayload.message || workflowPayload.error || workflowPayload.details || `HTTP ${webhookResponse.status}`;
+      await pool.query(
+        `UPDATE leads
+         SET dialfire_last_error = $1,
+             updated_at = NOW()
+         WHERE id = $2 AND company_id = $3`,
+        [String(details).slice(0, 2000), leadId, COMPANY_IDS.RC360]
+      );
+      return res.status(502).json({ success: false, message: "Dialfire konnte nicht vorbereitet werden.", details });
+    }
+
+    return res.json({
+      success: true,
+      lead_id: leadId,
+      requested_at: requestedAt,
+      ...workflowPayload
+    });
+  } catch (error) {
+    console.error("[dialfire prepare]", error);
+    await pool.query(
+      `UPDATE leads
+       SET dialfire_last_error = $1,
+           updated_at = NOW()
+       WHERE id = $2 AND company_id = $3`,
+      [String(error.message || error).slice(0, 2000), leadId, COMPANY_IDS.RC360]
+    ).catch(() => {});
+    return res.status(500).json({ success: false, message: error.message || "Dialfire-Vorbereitung fehlgeschlagen." });
+  }
+});
+
+// n8n schreibt vorbereitete Kontakte, Gesprächsergebnisse und Sync-Events
+// ausschließlich für Company 6 über diesen internen Endpunkt zurück.
+app.post("/internal/dialfire/events", requireN8nInternalToken, async (req, res) => {
+  const body = req.body || {};
+  const companyId = Number(body.company_id);
+  const externalRef = cleanString(body.external_ref || body.externalRef);
+  const leadIdFromRef = Number((externalRef.match(/^rc360:lead:(\d+)$/) || [])[1]);
+  const leadId = Number(body.lead_id || leadIdFromRef);
+
+  if (companyId !== COMPANY_IDS.RC360) {
+    return res.status(403).json({ success: false, message: "Nur company_id 6 ist zulässig." });
+  }
+  if (!Number.isInteger(leadId) || leadId <= 0) {
+    return res.status(400).json({ success: false, message: "Gültige lead_id oder RC360 external_ref fehlt." });
+  }
+
+  const eventType = cleanString(body.event_type || "result").toLowerCase();
+  const status = cleanString(body.status);
+  const statusDetail = cleanString(body.status_detail || body.statusDetail);
+  const rawOccurredAt = cleanString(body.occurred_at || body.occurredAt);
+  const occurredAt = rawOccurredAt && !Number.isNaN(Date.parse(rawOccurredAt))
+    ? new Date(rawOccurredAt).toISOString()
+    : new Date().toISOString();
+  const callOccurredAt = eventType === "prepared" ? "" : occurredAt;
+  const rawFollowUpAt = cleanString(body.follow_up_at || body.followUpAt);
+  const followUpAt = rawFollowUpAt && !Number.isNaN(Date.parse(rawFollowUpAt))
+    ? new Date(rawFollowUpAt).toISOString()
+    : "";
+  const recordingUrl = cleanString(body.recording_url || body.recordingUrl);
+  const hasDuration = body.duration_seconds !== null && body.duration_seconds !== undefined && body.duration_seconds !== "";
+  const durationSeconds = hasDuration && Number.isFinite(Number(body.duration_seconds))
+    ? Math.max(0, Math.round(Number(body.duration_seconds)))
+    : null;
+  const allowedCrmStatuses = new Set(["analyzed", "follow_up", "meeting", "won", "lost", "existing_customer", "no_interest"]);
+  const requestedCrmStatus = cleanString(body.crm_status);
+  const crmStatus = allowedCrmStatuses.has(requestedCrmStatus) ? requestedCrmStatus : "";
+  const rawPayload = body.raw && typeof body.raw === "object" ? body.raw : body;
+  const providerEventId = cleanString(body.provider_event_id) || crypto
+    .createHash("sha256")
+    .update(JSON.stringify([leadId, eventType, status, statusDetail, occurredAt, recordingUrl]))
+    .digest("hex");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const leadExists = await client.query(
+      "SELECT id FROM leads WHERE id = $1 AND company_id = $2 FOR UPDATE",
+      [leadId, COMPANY_IDS.RC360]
+    );
+    if (!leadExists.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "RC360-Lead nicht gefunden." });
+    }
+
+    const insertedEvent = await client.query(
+      `INSERT INTO dialfire_call_events
+        (company_id, lead_id, provider_event_id, event_type, status, status_detail, occurred_at, payload)
+       VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7::timestamptz, $8::jsonb)
+       ON CONFLICT (company_id, provider_event_id) DO NOTHING
+       RETURNING id`,
+      [COMPANY_IDS.RC360, leadId, providerEventId, eventType, status, statusDetail, occurredAt, JSON.stringify(rawPayload)]
+    );
+
+    if (!insertedEvent.rows.length) {
+      await client.query("COMMIT");
+      return res.json({ success: true, duplicate: true, lead_id: leadId, provider_event_id: providerEventId });
+    }
+
+    const updatedLead = await client.query(
+      `UPDATE leads
+       SET dialfire_contact_id = COALESCE(NULLIF($1, ''), dialfire_contact_id),
+           dialfire_campaign_id = COALESCE(NULLIF($2, ''), dialfire_campaign_id),
+           dialfire_task_name = COALESCE(NULLIF($3, ''), dialfire_task_name),
+           dialfire_external_ref = COALESCE(NULLIF($4, ''), dialfire_external_ref),
+           dialfire_last_status = COALESCE(NULLIF($5, ''), dialfire_last_status),
+           dialfire_status_detail = COALESCE(NULLIF($6, ''), dialfire_status_detail),
+           dialfire_agent = COALESCE(NULLIF($7, ''), dialfire_agent),
+           dialfire_call_requested_at = CASE WHEN $8 = 'prepared' THEN $9::timestamptz ELSE dialfire_call_requested_at END,
+           dialfire_last_called_at = COALESCE(NULLIF($10, '')::timestamptz, dialfire_last_called_at),
+           dialfire_call_duration_seconds = COALESCE($11::integer, dialfire_call_duration_seconds),
+           dialfire_recording_url = COALESCE(NULLIF($12, ''), dialfire_recording_url),
+           dialfire_synced_at = NOW(),
+           dialfire_last_error = NULL,
+           crm_status = CASE WHEN NULLIF($13, '') IS NOT NULL THEN $13 ELSE crm_status END,
+           crm_follow_up = CASE WHEN NULLIF($14, '') IS NOT NULL THEN $14::timestamptz ELSE crm_follow_up END,
+           crm_next_step = CASE
+                             WHEN NULLIF($14, '') IS NOT NULL THEN COALESCE(NULLIF($15, ''), 'Dialfire Follow-up')
+                             ELSE crm_next_step
+                           END,
+           crm_reminded_at = CASE WHEN NULLIF($14, '') IS NOT NULL THEN NULL ELSE crm_reminded_at END,
+           crm_snoozed_until = CASE WHEN NULLIF($14, '') IS NOT NULL THEN NULL ELSE crm_snoozed_until END,
+           call_notes = COALESCE(NULLIF($16, ''), call_notes),
+           updated_at = NOW()
+       WHERE id = $17 AND company_id = $18
+       RETURNING id, company_id, crm_status,
+                 crm_follow_up AS follow_up,
+                 crm_next_step AS next_step,
+                 call_notes,
+                 dialfire_contact_id, dialfire_external_ref,
+                 dialfire_last_status, dialfire_status_detail,
+                 dialfire_last_called_at, dialfire_call_duration_seconds,
+                 dialfire_recording_url, dialfire_synced_at`,
+      [
+        cleanString(body.dialfire_contact_id),
+        cleanString(body.campaign_id),
+        cleanString(body.task_name),
+        externalRef,
+        status,
+        statusDetail,
+        cleanString(body.agent),
+        eventType,
+        occurredAt,
+        callOccurredAt,
+        durationSeconds,
+        recordingUrl,
+        crmStatus,
+        followUpAt,
+        cleanString(body.next_step),
+        cleanString(body.notes),
+        leadId,
+        COMPANY_IDS.RC360
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      success: true,
+      duplicate: false,
+      provider_event_id: providerEventId,
+      lead: updatedLead.rows[0]
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[dialfire event]", error);
+    return res.status(500).json({ success: false, message: error.message || "Dialfire-Event konnte nicht gespeichert werden." });
+  } finally {
+    client.release();
   }
 });
 

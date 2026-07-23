@@ -1201,6 +1201,9 @@ app.get("/leads", checkJwt, async (req, res) => {
     }
 
     const whereStr = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const leadOrderBy = Number(companyId) === COMPANY_IDS.KOPIETZ_KI
+      ? "created_at DESC NULLS LAST, id DESC"
+      : "opportunity_score DESC NULLS LAST, id DESC";
 
     const result = await pool.query(
       `SELECT
@@ -1243,7 +1246,7 @@ app.get("/leads", checkJwt, async (req, res) => {
         created_at, updated_at
        FROM leads
        ${whereStr}
-       ORDER BY opportunity_score DESC NULLS LAST, id DESC
+       ORDER BY ${leadOrderBy}
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, limit, offset]
     );

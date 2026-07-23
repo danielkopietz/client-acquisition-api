@@ -27,6 +27,7 @@ const N8N_BASE = process.env.N8N_BASE_URL || "https://automatisierung.automatisi
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 const RESET_SECRET = process.env.RESET_SECRET || "";
 
+const N8N_K1_WF00_SCAN_WEBHOOK_URL = process.env.N8N_K1_WF00_SCAN_WEBHOOK_URL || `${N8N_BASE}/k1-dashboard-scan`;
 const N8N_K1_WF01_IMPORT_WEBHOOK_URL = process.env.N8N_K1_WF01_IMPORT_WEBHOOK_URL || `${N8N_BASE}/k1-hubspot-contacts-import`;
 const N8N_K1_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_K1_WF02_SELECTED_WEBHOOK_URL || process.env.N8N_K1_WF02_WEBHOOK_URL || `${N8N_BASE}/k1-selected-leads`;
 const N8N_B4S_WF02_SELECTED_WEBHOOK_URL = process.env.N8N_B4S_WF02_SELECTED_WEBHOOK_URL || "";
@@ -281,6 +282,14 @@ const ARCHIVED_LEAD_STATUSES = Object.freeze([
   "done",
   "closed",
   "outreach_completed"
+]);
+
+const K1_SCAN_TARGET_GROUPS = Object.freeze([
+  "Social Media Agenturen",
+  "Webdesign Agenturen",
+  "Personaldienstleister",
+  "SEO Agenturen",
+  "Recruiting-Agenturen"
 ]);
 
 function getArchiveMode(value) {
@@ -657,6 +666,15 @@ app.post("/scans", checkJwt, async (req, res) => {
       });
     }
 
+    if (
+      Number(companyId) === COMPANY_IDS.KOPIETZ_KI &&
+      !K1_SCAN_TARGET_GROUPS.includes(String(industry).trim())
+    ) {
+      return res.status(400).json({
+        error: "Ungültige Zielgruppe für Company 1."
+      });
+    }
+
     scanStage = "credit_check";
     const creditCheck = await pool.query(
       "SELECT credits_total, credits_used, (credits_total - credits_used) AS credits_remaining FROM companies WHERE id = $1",
@@ -723,10 +741,11 @@ app.post("/scans", checkJwt, async (req, res) => {
     createdScanId = newScan.id;
 
     let webhookResult = { sent: false };
+    const isK1Scan = Number(companyId) === COMPANY_IDS.KOPIETZ_KI;
     const isVFScan = Number(companyId) === COMPANY_IDS.VIRALITYFILMS;
     const isRC360Scan = Number(companyId) === COMPANY_IDS.RC360;
 
-    if (isVFScan || isRC360Scan) {
+    if (isK1Scan || isVFScan || isRC360Scan) {
       const minEmployees = isVFScan
         ? parsePositiveInt(req.body.min_employees, 51, 100000)
         : parsePositiveInt(req.body.min_employees, 1, 100000);
@@ -735,9 +754,15 @@ app.post("/scans", checkJwt, async (req, res) => {
         : parsePositiveInt(req.body.max_employees, 100000, 100000);
       const cityOverride = String(req.body.city || "").trim();
       const source = String(req.body.source || (isVFScan ? "apollo_outscraper" : "implisense_serper")).trim();
-      const canonicalScanUrl = `${N8N_BASE}/${isVFScan ? "vf-maps-scraper" : "rc360-dashboard-scan"}`;
+      const canonicalScanPath = isK1Scan
+        ? "k1-dashboard-scan"
+        : (isVFScan ? "vf-maps-scraper" : "rc360-dashboard-scan");
+      const canonicalScanUrl = `${N8N_BASE}/${canonicalScanPath}`;
+      const configuredScanUrl = isK1Scan
+        ? N8N_K1_WF00_SCAN_WEBHOOK_URL
+        : (isVFScan ? process.env.N8N_VF_SCAN_WEBHOOK_URL : N8N_RC360_SCAN_WEBHOOK_URL);
       const scanUrls = [...new Set([
-        isVFScan ? process.env.N8N_VF_SCAN_WEBHOOK_URL : N8N_RC360_SCAN_WEBHOOK_URL,
+        configuredScanUrl,
         canonicalScanUrl
       ].filter(Boolean))];
 
@@ -753,7 +778,7 @@ app.post("/scans", checkJwt, async (req, res) => {
 
       const payload = {
         scan_id: newScan.id,
-        company_id: isVFScan ? COMPANY_IDS.VIRALITYFILMS : COMPANY_IDS.RC360,
+        company_id: Number(companyId),
         industry: newScan.industry,
         region: newScan.region,
         city: cityOverride || null,
@@ -763,7 +788,9 @@ app.post("/scans", checkJwt, async (req, res) => {
         source
       };
 
-      scanStage = isVFScan ? "start_company3_workflow" : "start_company6_workflow";
+      scanStage = isK1Scan
+        ? "start_company1_wf00"
+        : (isVFScan ? "start_company3_workflow" : "start_company6_workflow");
       const workflowAttempts = [];
 
       for (const scanUrl of scanUrls) {
@@ -788,7 +815,7 @@ app.post("/scans", checkJwt, async (req, res) => {
             webhookResult = {
               sent: true,
               status: webhookResponse.status,
-              mode: isVFScan ? "vf-maps-scraper" : "rc360-dashboard-scan",
+              mode: canonicalScanPath,
               url: scanUrl
             };
             break;
@@ -808,9 +835,11 @@ app.post("/scans", checkJwt, async (req, res) => {
         ).catch(() => {});
 
         return res.status(502).json({
-          error: isVFScan
-            ? "Company-3-Workflow konnte nicht gestartet werden."
-            : "Company-6-Workflow konnte nicht gestartet werden.",
+          error: isK1Scan
+            ? "Company-1-WF00 konnte nicht gestartet werden."
+            : (isVFScan
+                ? "Company-3-Workflow konnte nicht gestartet werden."
+                : "Company-6-Workflow konnte nicht gestartet werden."),
           stage: scanStage,
           attempts: workflowAttempts
         });

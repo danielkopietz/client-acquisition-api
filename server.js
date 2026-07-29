@@ -120,6 +120,426 @@ function firstNonEmpty(...values) {
   return "";
 }
 
+function countCsvDelimiter(line, delimiter) {
+  let count = 0;
+  let inQuotes = false;
+
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === '"') {
+      if (inQuotes && line[index + 1] === '"') {
+        index++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === delimiter && !inQuotes) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+function detectCsvDelimiter(text) {
+  const firstLine = String(text || "")
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .find(line => line.trim()) || "";
+  const candidates = [",", ";", "\t", "|"];
+  return candidates
+    .map(delimiter => ({ delimiter, count: countCsvDelimiter(firstLine, delimiter) }))
+    .sort((left, right) => right.count - left.count)[0]?.count > 0
+    ? candidates
+        .map(delimiter => ({ delimiter, count: countCsvDelimiter(firstLine, delimiter) }))
+        .sort((left, right) => right.count - left.count)[0].delimiter
+    : ",";
+}
+
+function parseCsvText(text) {
+  const input = String(text || "").replace(/^\uFEFF/, "");
+  const delimiter = detectCsvDelimiter(input);
+  const matrix = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < input.length; index++) {
+    const char = input[index];
+    const next = input[index + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        field += '"';
+        index++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === delimiter && !inQuotes) {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") index++;
+      row.push(field);
+      if (row.some(value => cleanString(value))) matrix.push(row);
+      row = [];
+      field = "";
+      continue;
+    }
+
+    field += char;
+  }
+
+  row.push(field);
+  if (row.some(value => cleanString(value))) matrix.push(row);
+  if (matrix.length < 2) {
+    return { delimiter, headers: matrix[0] || [], rows: [] };
+  }
+
+  const headers = matrix[0].map(header => cleanString(header));
+  const rows = matrix.slice(1).map(values => {
+    const parsed = {};
+    headers.forEach((header, index) => {
+      parsed[header] = values[index] ?? "";
+    });
+    return parsed;
+  });
+
+  return { delimiter, headers, rows };
+}
+
+function normalizeCsvFieldName(value) {
+  return cleanString(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function getCsvField(row, ...aliases) {
+  if (!row || typeof row !== "object") return "";
+  const fields = new Map(
+    Object.entries(row).map(([key, value]) => [normalizeCsvFieldName(key), value])
+  );
+
+  for (const alias of aliases) {
+    const value = fields.get(normalizeCsvFieldName(alias));
+    if (value !== undefined && cleanString(value)) return cleanString(value);
+  }
+  return "";
+}
+
+function slugifyK1ImportList(value) {
+  return cleanString(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 54) || "hubspot_csv";
+}
+
+function normalizeK1ImportWebsite(websiteValue, domainValue, emailValue = "") {
+  let raw = firstNonEmpty(websiteValue, domainValue);
+  if (!raw && emailValue) raw = emailValue.split("@")[1] || "";
+  raw = cleanString(raw);
+  if (!raw) return { website: null, website_host: null };
+
+  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+    return host ? { website: `https://${host}`, website_host: host } : { website: null, website_host: null };
+  } catch (_) {
+    const match = raw.match(/(?:https?:\/\/)?(?:www\.)?([^\s/?#]+\.[^\s/?#]{2,})/i);
+    const host = match?.[1]?.replace(/^www\./i, "").toLowerCase() || "";
+    return host ? { website: `https://${host}`, website_host: host } : { website: null, website_host: null };
+  }
+}
+
+function companyNameFromHost(host) {
+  const base = cleanString(host).split(".")[0] || "";
+  return base
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function parseK1ImportAddress(value) {
+  const fullAddress = cleanString(value);
+  if (!fullAddress) return { street: null, postal_code: null, city: null };
+
+  const postalMatch = fullAddress.match(/(?:^|,\s*)(\d{5})\s+(.+?)\s*$/);
+  if (!postalMatch) return { street: fullAddress, postal_code: null, city: null };
+
+  const street = fullAddress
+    .slice(0, postalMatch.index)
+    .replace(/[,\s]+$/g, "")
+    .trim();
+  return {
+    street: street || null,
+    postal_code: postalMatch[1] || null,
+    city: cleanString(postalMatch[2]) || null
+  };
+}
+
+function normalizeK1ImportRows(sourceRows, importListName, importListKey) {
+  const normalizedByKey = new Map();
+  let invalidCount = 0;
+  let duplicateCount = 0;
+
+  for (const source of sourceRows) {
+    const email = normalizeEmail(getCsvField(
+      source,
+      "final_email",
+      "email",
+      "e-mail",
+      "email address",
+      "e-mail-adresse"
+    ));
+    const websiteMeta = normalizeK1ImportWebsite(
+      getCsvField(source, "website", "company website", "company website full", "webseite", "url"),
+      getCsvField(source, "domain", "company domain", "domäne"),
+      email
+    );
+    const explicitCompany = getCsvField(
+      source,
+      "lead_name",
+      "company_name",
+      "company name",
+      "company",
+      "unternehmen",
+      "firma",
+      "name"
+    );
+    const leadName = explicitCompany || companyNameFromHost(websiteMeta.website_host);
+    const fullAddress = getCsvField(
+      source,
+      "fulladdress",
+      "full address",
+      "company address",
+      "adresse",
+      "address"
+    );
+    const parsedAddress = parseK1ImportAddress(fullAddress);
+    const city = firstNonEmpty(
+      getCsvField(source, "city", "company city", "ort"),
+      parsedAddress.city
+    );
+    const postalCode = firstNonEmpty(
+      getCsvField(source, "postal_code", "postal code", "zip", "plz"),
+      parsedAddress.postal_code
+    );
+    const street = firstNonEmpty(
+      getCsvField(source, "street", "company street", "straße", "strasse"),
+      parsedAddress.street
+    );
+
+    if (!leadName || (!email && !websiteMeta.website_host && !fullAddress && !city)) {
+      invalidCount++;
+      continue;
+    }
+
+    const firstName = getCsvField(source, "first_name", "first name", "firstname", "vorname");
+    const lastName = getCsvField(source, "last_name", "last name", "lastname", "nachname");
+    const contactPerson = firstNonEmpty(
+      getCsvField(source, "contact_person", "contact person", "full name", "ansprechpartner"),
+      [firstName, lastName].filter(Boolean).join(" ")
+    );
+    const industry = getCsvField(source, "industry", "branche");
+    const region = getCsvField(source, "region", "state_region", "state", "company state", "bundesland");
+    const phone = getCsvField(source, "phone", "company phone number", "telephone", "telefon");
+    const sourceId = firstNonEmpty(email, websiteMeta.website_host, `${leadName}|${postalCode}|${city}`);
+    const dedupeKey = email
+      ? `email:${email}`
+      : websiteMeta.website_host
+        ? `domain:${websiteMeta.website_host}`
+        : `company:${normalizeCsvFieldName(sourceId)}`;
+
+    if (normalizedByKey.has(dedupeKey)) {
+      duplicateCount++;
+      continue;
+    }
+
+    const notes = [
+      "CSV Import Company 1",
+      `Lead-Liste: ${importListName}`,
+      fullAddress ? `Adresse: ${fullAddress}` : "",
+      !email ? "E-Mail wird in der Analyse/Anreicherung ergänzt." : ""
+    ].filter(Boolean).join("\n");
+
+    normalizedByKey.set(dedupeKey, {
+      lead_name: leadName,
+      website: websiteMeta.website,
+      website_host: websiteMeta.website_host,
+      email: email || null,
+      final_email: email || null,
+      final_email_type: email ? "csv_import" : null,
+      phone: phone || null,
+      contact_person: contactPerson || null,
+      inhaber_vorname: firstName || null,
+      inhaber_nachname: lastName || null,
+      industry: industry || null,
+      city: city || null,
+      region: region || null,
+      street: street || null,
+      postal_code: postalCode || null,
+      status: "hubspot_imported",
+      source_pipeline: importListKey,
+      notes,
+      audit_summary: [
+        "CSV-Datensatz importiert",
+        websiteMeta.website_host ? `Domain: ${websiteMeta.website_host}` : "",
+        city ? `Ort: ${city}` : "",
+        email ? "E-Mail vorhanden" : "E-Mail noch offen"
+      ].filter(Boolean).join(" | ")
+    });
+  }
+
+  return {
+    rows: [...normalizedByKey.values()],
+    invalid_count: invalidCount,
+    duplicate_count: duplicateCount
+  };
+}
+
+async function importK1ContactsDirect(normalizedRows) {
+  const rowsJson = JSON.stringify(normalizedRows);
+  const result = await pool.query(
+    `WITH incoming AS (
+       SELECT *
+       FROM jsonb_to_recordset($2::jsonb) AS x(
+         lead_name text,
+         website text,
+         website_host text,
+         email text,
+         final_email text,
+         final_email_type text,
+         phone text,
+         contact_person text,
+         inhaber_vorname text,
+         inhaber_nachname text,
+         industry text,
+         city text,
+         region text,
+         street text,
+         postal_code text,
+         status text,
+         source_pipeline text,
+         notes text,
+         audit_summary text
+       )
+     ),
+     updated AS (
+       UPDATE leads l
+       SET
+         lead_name = COALESCE(NULLIF(d.lead_name, ''), l.lead_name),
+         website = COALESCE(NULLIF(d.website, ''), l.website),
+         email = COALESCE(NULLIF(d.email, ''), l.email),
+         final_email = COALESCE(NULLIF(d.final_email, ''), l.final_email),
+         final_email_type = COALESCE(NULLIF(d.final_email_type, ''), l.final_email_type),
+         phone = COALESCE(NULLIF(d.phone, ''), l.phone),
+         contact_person = COALESCE(NULLIF(d.contact_person, ''), l.contact_person),
+         inhaber_vorname = COALESCE(NULLIF(d.inhaber_vorname, ''), l.inhaber_vorname),
+         inhaber_nachname = COALESCE(NULLIF(d.inhaber_nachname, ''), l.inhaber_nachname),
+         industry = COALESCE(NULLIF(d.industry, ''), l.industry),
+         city = COALESCE(NULLIF(d.city, ''), l.city),
+         region = COALESCE(NULLIF(d.region, ''), l.region),
+         street = COALESCE(NULLIF(d.street, ''), l.street),
+         postal_code = COALESCE(NULLIF(d.postal_code, ''), l.postal_code),
+         source_pipeline = COALESCE(NULLIF(d.source_pipeline, ''), l.source_pipeline),
+         notes = CASE
+           WHEN NULLIF(d.notes, '') IS NULL OR POSITION(d.notes IN COALESCE(l.notes, '')) > 0 THEN l.notes
+           ELSE CONCAT_WS(E'\n', NULLIF(l.notes, ''), d.notes)
+         END,
+         audit_summary = COALESCE(NULLIF(d.audit_summary, ''), l.audit_summary),
+         updated_at = NOW()
+       FROM incoming d
+       WHERE l.company_id = $1
+         AND (
+           (
+             NULLIF(d.email, '') IS NOT NULL
+             AND lower(COALESCE(l.final_email, l.email, '')) = lower(d.email)
+           )
+           OR (
+             NULLIF(d.email, '') IS NULL
+             AND NULLIF(d.website_host, '') IS NOT NULL
+             AND lower(
+               regexp_replace(
+                 regexp_replace(COALESCE(l.website, ''), '^https?://(www\\.)?', '', 'i'),
+                 '/.*$',
+                 ''
+               )
+             ) = lower(d.website_host)
+           )
+           OR (
+             NULLIF(d.email, '') IS NULL
+             AND NULLIF(d.website_host, '') IS NULL
+             AND lower(trim(COALESCE(l.lead_name, ''))) = lower(trim(d.lead_name))
+             AND lower(trim(COALESCE(l.city, ''))) = lower(trim(COALESCE(d.city, '')))
+           )
+         )
+       RETURNING l.id
+     ),
+     inserted AS (
+       INSERT INTO leads (
+         company_id, lead_name, website, email, final_email, final_email_type,
+         phone, contact_person, inhaber_vorname, inhaber_nachname,
+         industry, city, region, street, postal_code, status, source_pipeline,
+         notes, audit_summary, created_at, updated_at
+       )
+       SELECT
+         $1, d.lead_name, d.website, d.email, d.final_email, d.final_email_type,
+         d.phone, d.contact_person, d.inhaber_vorname, d.inhaber_nachname,
+         d.industry, d.city, d.region, d.street, d.postal_code, d.status, d.source_pipeline,
+         d.notes, d.audit_summary, NOW(), NOW()
+       FROM incoming d
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM leads l
+         WHERE l.company_id = $1
+           AND (
+             (
+               NULLIF(d.email, '') IS NOT NULL
+               AND lower(COALESCE(l.final_email, l.email, '')) = lower(d.email)
+             )
+             OR (
+               NULLIF(d.email, '') IS NULL
+               AND NULLIF(d.website_host, '') IS NOT NULL
+               AND lower(
+                 regexp_replace(
+                   regexp_replace(COALESCE(l.website, ''), '^https?://(www\\.)?', '', 'i'),
+                   '/.*$',
+                   ''
+                 )
+               ) = lower(d.website_host)
+             )
+             OR (
+               NULLIF(d.email, '') IS NULL
+               AND NULLIF(d.website_host, '') IS NULL
+               AND lower(trim(COALESCE(l.lead_name, ''))) = lower(trim(d.lead_name))
+               AND lower(trim(COALESCE(l.city, ''))) = lower(trim(COALESCE(d.city, '')))
+             )
+           )
+       )
+       ON CONFLICT DO NOTHING
+       RETURNING id
+     )
+     SELECT
+       (SELECT COUNT(*)::int FROM inserted) AS inserted,
+       (SELECT COUNT(*)::int FROM updated) AS updated`,
+    [COMPANY_IDS.KOPIETZ_KI, rowsJson]
+  );
+
+  return result.rows[0] || { inserted: 0, updated: 0 };
+}
+
 function buildInstantlyLeadPayload(lead, overrides = {}) {
   const contactPerson = firstNonEmpty(
     overrides.contact_person,
@@ -900,43 +1320,143 @@ app.post("/scan/start", checkJwt, async (req, res) => {
 });
 
 app.post("/contacts/import", checkJwt, async (req, res) => {
+  let importStage = "validate_request";
   try {
     const companyId = getCompanyId(req);
     if (Number(companyId) !== COMPANY_IDS.KOPIETZ_KI) {
       return res.status(403).json({ success: false, message: "CSV-Import ist nur für Company 1 aktiviert." });
     }
+
     const csv = typeof req.body?.csv === "string" ? req.body.csv : "";
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    const suppliedRows = Array.isArray(req.body?.rows) ? req.body.rows : null;
     const importListName = String(req.body?.list_name || req.body?.import_list_name || req.body?.filename || "HubSpot CSV Import").trim();
-    const importListKey = `k1_import_${importListName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 54) || "hubspot_csv"}`;
-    if (!csv && !rows) {
+    const importListKey = `k1_import_${slugifyK1ImportList(importListName)}`;
+    if (!csv && !suppliedRows) {
       return res.status(400).json({ success: false, message: "CSV-Text oder rows-Array fehlt." });
     }
-    const webhookRes = await safeFetch(N8N_K1_WF01_IMPORT_WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-token": N8N_INTERNAL_TOKEN
-      },
-      body: JSON.stringify({
-        company_id: COMPANY_IDS.KOPIETZ_KI,
+
+    importStage = "parse_csv";
+    const parsed = suppliedRows
+      ? { delimiter: "rows", headers: Object.keys(suppliedRows[0] || {}), rows: suppliedRows }
+      : parseCsvText(csv);
+
+    if (!parsed.rows.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Die CSV enthält keine importierbaren Datenzeilen.",
+        detected_delimiter: parsed.delimiter,
+        detected_headers: parsed.headers
+      });
+    }
+
+    if (parsed.rows.length > 10000) {
+      return res.status(413).json({
+        success: false,
+        message: "Maximal 10.000 Datensätze pro Import. Bitte die CSV aufteilen."
+      });
+    }
+
+    importStage = "normalize_rows";
+    const normalized = normalizeK1ImportRows(parsed.rows, importListName, importListKey);
+    if (!normalized.rows.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Keine gültigen Unternehmen oder Kontakte gefunden. Benötigt werden mindestens Firmenname plus Website/Domain oder eine gültige E-Mail.",
+        detected_delimiter: parsed.delimiter,
+        detected_headers: parsed.headers,
+        received_count: parsed.rows.length,
+        invalid_count: normalized.invalid_count
+      });
+    }
+
+    importStage = "direct_database_import";
+    try {
+      const imported = await importK1ContactsDirect(normalized.rows);
+      return res.json({
+        success: true,
+        import_mode: "server_direct",
         filename: req.body?.filename || null,
         list_name: importListName,
         list_key: importListKey,
-        csv,
-        rows
-      })
-    });
-    const text = await webhookRes.text();
-    let payload = null;
-    try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text }; }
-    if (!webhookRes.ok) {
-      return res.status(500).json({ success: false, message: "WF01 Import konnte nicht gestartet werden.", details: payload });
+        delimiter: parsed.delimiter,
+        received_count: parsed.rows.length,
+        valid_contacts: normalized.rows.length,
+        inserted: Number(imported.inserted || 0),
+        updated: Number(imported.updated || 0),
+        skipped_count: normalized.invalid_count + normalized.duplicate_count,
+        invalid_count: normalized.invalid_count,
+        duplicate_count: normalized.duplicate_count
+      });
+    } catch (directError) {
+      console.error("[contacts/import direct]", {
+        message: directError.message,
+        code: directError.code,
+        filename: req.body?.filename || null
+      });
+
+      importStage = "n8n_fallback";
+      const webhookUrls = [...new Set([
+        N8N_K1_WF01_IMPORT_WEBHOOK_URL,
+        `${N8N_BASE}/k1-hubspot-contacts-import`
+      ].filter(Boolean))];
+      const webhookAttempts = [];
+
+      for (const webhookUrl of webhookUrls) {
+        try {
+          const webhookRes = await safeFetch(webhookUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-internal-token": N8N_INTERNAL_TOKEN
+            },
+            body: JSON.stringify({
+              company_id: COMPANY_IDS.KOPIETZ_KI,
+              filename: req.body?.filename || null,
+              list_name: importListName,
+              list_key: importListKey,
+              csv,
+              rows: suppliedRows
+            })
+          });
+          const text = await webhookRes.text();
+          let payload = null;
+          try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text }; }
+
+          if (webhookRes.ok) {
+            return res.json({
+              success: true,
+              import_mode: "n8n_fallback",
+              delimiter: parsed.delimiter,
+              received_count: parsed.rows.length,
+              skipped_count: normalized.invalid_count + normalized.duplicate_count,
+              ...(payload || {})
+            });
+          }
+
+          webhookAttempts.push({ url: webhookUrl, status: webhookRes.status, response: payload });
+        } catch (webhookError) {
+          webhookAttempts.push({ url: webhookUrl, error: webhookError.message });
+        }
+      }
+
+      return res.status(502).json({
+        success: false,
+        message: `CSV-Import fehlgeschlagen: ${directError.message}`,
+        stage: importStage,
+        direct_error: {
+          message: directError.message,
+          code: directError.code || null
+        },
+        webhook_attempts: webhookAttempts
+      });
     }
-    return res.json({ success: true, ...(payload || {}) });
   } catch (error) {
-    console.error("[contacts/import]", error);
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("[contacts/import]", { stage: importStage, message: error.message, stack: error.stack });
+    return res.status(500).json({
+      success: false,
+      message: `CSV-Import fehlgeschlagen: ${error.message}`,
+      stage: importStage
+    });
   }
 });
 

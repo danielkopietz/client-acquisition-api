@@ -704,6 +704,90 @@ const ARCHIVED_LEAD_STATUSES = Object.freeze([
   "outreach_completed"
 ]);
 
+const RC360_DIALFIRE_PIPELINE_STATUSES = Object.freeze([
+  "analyzed",
+  "email_sent",
+  "email_opened",
+  "bounced",
+  "video_opened",
+  "meeting",
+  "won",
+  "existing_customer",
+  "no_interest",
+  "lost"
+]);
+
+const RC360_DIALFIRE_PIPELINE_LABELS = Object.freeze({
+  analyzed: "Analysiert",
+  email_sent: "Mail gesendet",
+  email_opened: "Mail geöffnet",
+  bounced: "Bounce",
+  video_opened: "Video geöffnet",
+  meeting: "Termin",
+  won: "Gewonnen",
+  existing_customer: "Bereits Kunde",
+  no_interest: "Kein Interesse",
+  lost: "Verloren"
+});
+
+function getRC360DialfirePipelineStatus(lead) {
+  const status = cleanString(lead?.status).toLowerCase();
+  const crmStatus = cleanString(lead?.crm_status).toLowerCase();
+  const outreachStatus = cleanString(lead?.outreach_status).toLowerCase();
+
+  if (RC360_DIALFIRE_PIPELINE_STATUSES.includes(crmStatus)) return crmStatus;
+  if ([crmStatus, status].some(value => ["lost", "disqualified"].includes(value))) return "lost";
+  if ([crmStatus, status].some(value => ["existing_customer", "customer"].includes(value))) return "existing_customer";
+  if ([crmStatus, status].includes("won")) return "won";
+  if ([crmStatus, status].includes("meeting")) return "meeting";
+  if (status === "bounced" || outreachStatus === "bounced") return "bounced";
+
+  const videoWasOpened =
+    status === "video_opened" ||
+    lead?.pitchlane_video_opened === true ||
+    Number(lead?.pitchlane_video_view_count || 0) > 0 ||
+    Boolean(lead?.pitchlane_first_opened_at);
+  if (videoWasOpened) return "video_opened";
+
+  if (
+    ["email_opened", "email_clicked", "replied"].includes(status) ||
+    ["email_opened", "email_clicked", "replied"].includes(outreachStatus)
+  ) return "email_opened";
+
+  if (
+    ["email_sent", "sent", "active", "outreach_active"].includes(status) ||
+    ["email_sent", "sent", "active"].includes(outreachStatus) ||
+    Boolean(lead?.outreach_sent_at)
+  ) return "email_sent";
+
+  return "analyzed";
+}
+
+function normalizeRC360DialfirePhone(value) {
+  const original = cleanString(value).replace(/^tel:/i, "").split(/(?:ext\.?|durchwahl|#)/i)[0];
+  if (!original) return "";
+
+  let phone = original.replace(/[^\d+]/g, "");
+  if (phone.startsWith("00")) phone = `+${phone.slice(2)}`;
+  else if (phone.startsWith("0")) phone = `+49${phone.slice(1)}`;
+  else if (/^49\d+$/.test(phone)) phone = `+${phone}`;
+  else if (/^\d+$/.test(phone)) phone = `+49${phone}`;
+
+  return /^\+[1-9]\d{6,14}$/.test(phone) ? phone : "";
+}
+
+function rc360CsvCell(value, { allowLeadingPlus = false } = {}) {
+  let text = value == null ? "" : String(value);
+  if (!allowLeadingPlus && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function rc360IsoDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
 const K1_SCAN_TARGET_GROUPS = Object.freeze([
   "Social Media Agenturen",
   "Webdesign Agenturen",
@@ -1775,6 +1859,207 @@ app.get("/leads", checkJwt, async (req, res) => {
   } catch (error) {
     console.error("Leads error:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Dialfire-CSV-Export ist bewusst ausschließlich für RC360 / company_id 6 verfügbar.
+// Die Company wird aus dem verifizierten Auth0-Token gelesen; ein Query-Parameter kann
+// weder eine andere Company freischalten noch Daten eines anderen Mandanten exportieren.
+app.get("/leads/export/dialfire.csv", checkJwt, async (req, res) => {
+  const companyId = parseInt(req.auth?.payload?.[`${NAMESPACE}/company_id`], 10);
+  if (Number(companyId) !== COMPANY_IDS.RC360) {
+    return res.status(403).json({
+      success: false,
+      message: "Der Dialfire-CSV-Export ist ausschließlich für RC360 verfügbar."
+    });
+  }
+
+  const requestedStatuses = cleanString(req.query.pipeline_status)
+    .toLowerCase()
+    .split(",")
+    .map(value => value.trim())
+    .filter(value => value && value !== "all");
+  const uniqueStatuses = [...new Set(requestedStatuses)];
+  const onlyDialable = !["false", "0", "no"].includes(
+    cleanString(req.query.only_dialable).toLowerCase()
+  );
+  const invalidStatuses = uniqueStatuses.filter(
+    value => !RC360_DIALFIRE_PIPELINE_STATUSES.includes(value)
+  );
+
+  if (invalidStatuses.length) {
+    return res.status(400).json({
+      success: false,
+      message: `Unbekannter Pipeline-Status: ${invalidStatuses.join(", ")}`,
+      allowed_statuses: RC360_DIALFIRE_PIPELINE_STATUSES
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         id, lead_name, industry, region, website, opportunity_score, priority,
+         sales_hook, final_sales_hook, marketing_analysis, notes, call_notes,
+         status, crm_status, outreach_status, outreach_sent_at, outreach_completed_at,
+         email, final_email, findymail_email, phone, contact_person, managing_director,
+         inhaber_vorname, inhaber_nachname, street, postal_code, city,
+         pitchlane_video_url, video_url, pitchlane_video_opened,
+         pitchlane_video_view_count, pitchlane_video_start_count, pitchlane_video_finish_count,
+         pitchlane_first_opened_at, pitchlane_last_opened_at,
+         pitchlane_first_started_at, pitchlane_last_started_at,
+         pitchlane_first_finished_at, pitchlane_last_finished_at,
+         pitchlane_hot_lead, pitchlane_engagement_status,
+         created_at, updated_at
+       FROM leads
+       WHERE company_id = $1
+         AND NOT (
+           COALESCE(status, '') = ANY($2::text[])
+           OR COALESCE(crm_status, '') = ANY($2::text[])
+         )
+       ORDER BY opportunity_score DESC NULLS LAST, id DESC`,
+      [COMPANY_IDS.RC360, ARCHIVED_LEAD_STATUSES]
+    );
+
+    const statusRows = result.rows
+      .map(lead => ({ ...lead, pipeline_status: getRC360DialfirePipelineStatus(lead) }))
+      .filter(lead => !uniqueStatuses.length || uniqueStatuses.includes(lead.pipeline_status));
+    const exportRows = statusRows
+      .map(lead => ({ ...lead, normalized_phone: normalizeRC360DialfirePhone(lead.phone) }))
+      .filter(lead => !onlyDialable || lead.normalized_phone);
+    const skippedInvalidPhones = statusRows.length - exportRows.length;
+
+    const header = [
+      "$ref",
+      "$phone",
+      "phone_original",
+      "company_name",
+      "contact_person",
+      "first_name",
+      "last_name",
+      "email",
+      "website",
+      "industry",
+      "street",
+      "postal_code",
+      "city",
+      "region",
+      "pipeline_status",
+      "pipeline_status_label",
+      "email_sent",
+      "email_sent_at",
+      "email_opened",
+      "video_opened",
+      "video_view_count",
+      "video_started",
+      "video_start_count",
+      "video_finished",
+      "video_finish_count",
+      "video_first_opened_at",
+      "video_last_opened_at",
+      "video_url",
+      "hot_lead",
+      "engagement_status",
+      "opportunity_score",
+      "priority",
+      "sales_hook",
+      "marketing_analysis",
+      "crm_notes",
+      "rc360_lead_id",
+      "exported_at"
+    ];
+
+    const exportedAt = new Date().toISOString();
+    const csvLines = [header.map(value => rc360CsvCell(value)).join(";")];
+
+    for (const lead of exportRows) {
+      const statusValues = [lead.status, lead.crm_status, lead.outreach_status]
+        .map(value => cleanString(value).toLowerCase());
+      const emailSent = Boolean(
+        lead.outreach_sent_at ||
+        statusValues.some(value => ["email_sent", "sent", "active", "outreach_active", "email_opened", "email_clicked", "replied"].includes(value))
+      );
+      const emailOpened = statusValues.some(
+        value => ["email_opened", "email_clicked", "replied"].includes(value)
+      );
+      const videoOpened = Boolean(
+        lead.pitchlane_video_opened === true ||
+        Number(lead.pitchlane_video_view_count || 0) > 0 ||
+        lead.pitchlane_first_opened_at
+      );
+      const firstName = firstNonEmpty(
+        lead.inhaber_vorname,
+        splitPersonName(firstNonEmpty(lead.contact_person, lead.managing_director)).firstName
+      );
+      const lastName = firstNonEmpty(
+        lead.inhaber_nachname,
+        splitPersonName(firstNonEmpty(lead.contact_person, lead.managing_director)).lastName
+      );
+
+      const values = [
+        `rc360:lead:${lead.id}`,
+        lead.normalized_phone,
+        cleanString(lead.phone),
+        cleanString(lead.lead_name),
+        firstNonEmpty(lead.contact_person, lead.managing_director, [firstName, lastName].filter(Boolean).join(" ")),
+        firstName,
+        lastName,
+        firstNonEmpty(lead.email, lead.final_email, lead.findymail_email),
+        cleanString(lead.website),
+        cleanString(lead.industry),
+        cleanString(lead.street),
+        cleanString(lead.postal_code),
+        cleanString(lead.city),
+        cleanString(lead.region),
+        lead.pipeline_status,
+        RC360_DIALFIRE_PIPELINE_LABELS[lead.pipeline_status] || lead.pipeline_status,
+        emailSent ? "true" : "false",
+        rc360IsoDate(lead.outreach_sent_at),
+        emailOpened ? "true" : "false",
+        videoOpened ? "true" : "false",
+        Number(lead.pitchlane_video_view_count || 0),
+        Number(lead.pitchlane_video_start_count || 0) > 0 ? "true" : "false",
+        Number(lead.pitchlane_video_start_count || 0),
+        Number(lead.pitchlane_video_finish_count || 0) > 0 ? "true" : "false",
+        Number(lead.pitchlane_video_finish_count || 0),
+        rc360IsoDate(lead.pitchlane_first_opened_at),
+        rc360IsoDate(lead.pitchlane_last_opened_at),
+        firstNonEmpty(lead.pitchlane_video_url, lead.video_url),
+        lead.pitchlane_hot_lead === true ? "true" : "false",
+        cleanString(lead.pitchlane_engagement_status),
+        lead.opportunity_score ?? "",
+        cleanString(lead.priority),
+        firstNonEmpty(lead.final_sales_hook, lead.sales_hook),
+        cleanString(lead.marketing_analysis),
+        firstNonEmpty(lead.call_notes, lead.notes),
+        lead.id,
+        exportedAt
+      ];
+
+      csvLines.push(
+        values.map((value, index) => rc360CsvCell(value, { allowLeadingPlus: index === 1 })).join(";")
+      );
+    }
+
+    const statusSuffix = uniqueStatuses.length === 1 ? uniqueStatuses[0] : "pipeline";
+    const dateSuffix = exportedAt.slice(0, 10);
+    const fileName = `rc360-dialfire-${statusSuffix}-${dateSuffix}.csv`;
+    const csv = `\uFEFF${csvLines.join("\r\n")}\r\n`;
+
+    res.set({
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${fileName}"`,
+      "Cache-Control": "private, no-store, max-age=0",
+      "X-Exported-Rows": String(exportRows.length),
+      "X-Skipped-Invalid-Phones": String(skippedInvalidPhones),
+      "Access-Control-Expose-Headers": "Content-Disposition, X-Exported-Rows, X-Skipped-Invalid-Phones"
+    });
+    return res.status(200).send(csv);
+  } catch (error) {
+    console.error("[leads/export/dialfire.csv]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Dialfire-CSV konnte nicht erstellt werden."
+    });
   }
 });
 
